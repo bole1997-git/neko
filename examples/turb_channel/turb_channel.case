@@ -49,8 +49,12 @@
             },
             "boundary_conditions": [
                 {
-                    "type": "no_slip",
-                    "zone_indices": [ 3, 4 ]
+                    "type": "wall_model",
+                    "zone_indices": [ 3, 4 ],
+                    "model": "spalding",
+                    "kappa": 0.41,
+                    "B": 5.2,
+                    "h_index": 1
                 }
             ],
             "output_control": "simulationtime",

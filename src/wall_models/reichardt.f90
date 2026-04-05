@@ -31,7 +31,18 @@
 ! POSSIBILITY OF SUCH DAMAGE.
 !
 !> Implements `reichardt_t`.
-!! Wall model based on Reichardt's universal law of the wall (1951).
+!! Wall model based on the original Reichardt (1951) two-term law of the wall:
+!!
+!!   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+!!
+!! This formula continuously covers the viscous sublayer, buffer layer, and
+!! logarithmic region without piecewise switching.
+!!
+!! Reference:
+!!   Reichardt, H. (1951). "Vollständige Darstellung der turbulenten
+!!   Geschwindigkeitsverteilung in Rohren." Zeitschrift für angewandte
+!!   Mathematik und Mechanik, 31(7-8), 208-219.
+!!
 module reichardt
   use field, only: field_t
   use num_types, only : rp
@@ -51,13 +62,17 @@ module reichardt
   implicit none
   private
 
-  !> Wall model based on Reichardt's universal law of the wall.
+  !> Wall model based on the original Reichardt (1951) law of the wall.
+  !!
+  !! The parameter B is stored for API compatibility with other wall models
+  !! but is not used in the Reichardt formula itself (which sets its own
+  !! log-law intercept implicitly through the exponential correction term).
   type, public, extends(wall_model_t) :: reichardt_t
-     !> The von Karman coefficient.
+     !> The von Kármán constant.
      real(kind=rp) :: kappa = 0.41_rp
-     !> The log-law intercept.
+     !> Log-law intercept (not used in Reichardt formula; kept for API compatibility).
      real(kind=rp) :: B = 5.2_rp
-     !> The kinematic viscosity.
+     !> Kinematic viscosity at wall boundary nodes.
      type(vector_t) :: nu
    contains
      !> Constructor from JSON.
@@ -140,7 +155,9 @@ contains
     call this%nu%init(this%n_nodes)
   end subroutine reichardt_init_from_components
 
-  !> Compute the kinematic viscosity vector.
+  !> Compute the kinematic viscosity vector at wall boundary nodes.
+  !! Evaluates ν = μ/ρ at each boundary node and gathers it into the
+  !! compact wall-node array this%nu.
   subroutine reichardt_compute_nu(this)
     class(reichardt_t), intent(inout) :: this
     type(field_t), pointer :: temp
@@ -160,13 +177,16 @@ contains
     call neko_scratch_registry%relinquish_field(idx)
   end subroutine reichardt_compute_nu
 
-  !> Destructor for the reichardt_t class.
+  !> Destructor.
   subroutine reichardt_free(this)
     class(reichardt_t), intent(inout) :: this
     call this%free_base()
   end subroutine reichardt_free
 
-  !> Compute the wall shear stress using Reichardt law.
+  !> Compute the wall shear stress using the Reichardt (1951) law.
+  !!
+  !! Calls reichardt_compute_cpu on CPU backends. GPU support is not yet
+  !! implemented.
   subroutine reichardt_compute(this, t, tstep)
     class(reichardt_t), intent(inout) :: this
     real(kind=rp), intent(in) :: t
@@ -182,10 +202,8 @@ contains
     w => neko_registry%get_field("w")
 
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       ! GPU implementation - placeholder
        error stop "Reichardt GPU kernel not yet implemented"
     else
-       ! CPU implementation - call reichardt_compute_cpu
        call reichardt_compute_cpu(u%x, v%x, w%x, &
             this%ind_r, this%ind_s, this%ind_t, this%ind_e, &
             this%n_x%x, this%n_y%x, this%n_z%x, &

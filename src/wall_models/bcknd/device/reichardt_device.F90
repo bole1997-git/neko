@@ -30,10 +30,16 @@
 ! ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 ! POSSIBILITY OF SUCH DAMAGE.
 !
-!> Implements the device kernel for the `reichardt_t` type.
+!> Fortran-C interface for the device (GPU) kernel of `reichardt_t`.
 !!
-!! This module provides GPU (CUDA/HIP) implementations of the Reichardt wall model.
-!! If GPU acceleration is not enabled, this module provides an error message.
+!! This module provides the Fortran binding to the CUDA/HIP C kernel that
+!! computes wall shear stress using the original two-term Reichardt (1951)
+!! law of the wall:
+!!
+!!   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+!!
+!! All formula logic lives in reichardt_kernel.h. This module contains only
+!! the Fortran interface declaration and the dispatch wrapper.
 !!
 module reichardt_device
   use num_types, only : rp, c_rp
@@ -85,36 +91,32 @@ module reichardt_device
   public :: reichardt_compute_device
 
 contains
-  !> Compute the wall shear stress on device using Reichardt's model.
+
+  !> Dispatch the Reichardt wall-model computation to the active GPU backend.
   !!
-  !! This routine calls the appropriate GPU backend (CUDA/HIP) to compute
-  !! the wall shear stress using the Reichardt (1951) universal law of the wall.
+  !! Calls the HIP or CUDA C kernel (defined in reichardt_kernel.h) which
+  !! implements the two-term Reichardt (1951) law. OpenCL is not yet supported.
   !!
-  !! Reference:
-  !!   Reichardt, H. (1951). "Vollständige Darstellung der turbulenten 
-  !!   Geschwindigkeitsverteilung in Rohren." Zeitschrift für angewandte 
-  !!   Mathematik und Mechanik, 31(7-8), 208-219.
-  !!
-  !! @param u_d GPU pointer to velocity x-component.
-  !! @param v_d GPU pointer to velocity y-component.
-  !! @param w_d GPU pointer to velocity z-component.
-  !! @param ind_r_d GPU pointer to r-direction indices.
-  !! @param ind_s_d GPU pointer to s-direction indices.
-  !! @param ind_t_d GPU pointer to t-direction indices.
-  !! @param ind_e_d GPU pointer to element indices.
-  !! @param n_x_d GPU pointer to x-component of wall normal.
-  !! @param n_y_d GPU pointer to y-component of wall normal.
-  !! @param n_z_d GPU pointer to z-component of wall normal.
-  !! @param nu_d GPU pointer to kinematic viscosity.
-  !! @param h_d GPU pointer to wall-normal distance.
-  !! @param tau_x_d GPU pointer to output x-component of wall shear stress.
-  !! @param tau_y_d GPU pointer to output y-component of wall shear stress.
-  !! @param tau_z_d GPU pointer to output z-component of wall shear stress.
-  !! @param n_nodes Number of boundary nodes.
-  !! @param lx Polynomial order in element.
-  !! @param kappa Von Kármán constant.
-  !! @param B Log-law intercept.
-  !! @param tstep Current time-step.
+  !! @param u_d       GPU pointer to velocity x-component.
+  !! @param v_d       GPU pointer to velocity y-component.
+  !! @param w_d       GPU pointer to velocity z-component.
+  !! @param ind_r_d   GPU pointer to r-direction indices.
+  !! @param ind_s_d   GPU pointer to s-direction indices.
+  !! @param ind_t_d   GPU pointer to t-direction indices.
+  !! @param ind_e_d   GPU pointer to element indices.
+  !! @param n_x_d     GPU pointer to x-component of wall-normal vector.
+  !! @param n_y_d     GPU pointer to y-component of wall-normal vector.
+  !! @param n_z_d     GPU pointer to z-component of wall-normal vector.
+  !! @param nu_d      GPU pointer to kinematic viscosity.
+  !! @param h_d       GPU pointer to wall-normal distance.
+  !! @param tau_x_d   GPU pointer to output x-component of wall shear stress.
+  !! @param tau_y_d   GPU pointer to output y-component of wall shear stress.
+  !! @param tau_z_d   GPU pointer to output z-component of wall shear stress.
+  !! @param n_nodes   Number of boundary nodes.
+  !! @param lx        Polynomial order in element.
+  !! @param kappa     Von Kármán constant.
+  !! @param B         Not used in the Reichardt formula; kept for API consistency.
+  !! @param tstep     Current time-step (used for initial guess selection).
   subroutine reichardt_compute_device(u_d, v_d, w_d, &
        ind_r_d, ind_s_d, ind_t_d, ind_e_d, &
        n_x_d, n_y_d, n_z_d, nu_d, h_d, tau_x_d, tau_y_d, tau_z_d, &

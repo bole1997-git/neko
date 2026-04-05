@@ -36,27 +36,37 @@
 
 /**
  * Device kernel for reichardt_compute
- * 
- * Implements the Reichardt (1951) universal law of the wall:
- *   u⁺ = y⁺/(1 + y⁺/11) + (1/κ)*ln(1 + 0.41*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
- * 
+ *
+ * Implements the original two-term Reichardt (1951) universal law of the wall:
+ *
+ *   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+ *
+ * Note: Some secondary sources add a spurious linear term y⁺/(1 + y⁺/11)
+ * that is NOT part of the original Reichardt (1951) formula and causes
+ * significant over-prediction of u⁺ in the log region. It has been removed.
+ *
  * Reference:
- *   Reichardt, H. (1951). "Vollständige Darstellung der turbulenten 
- *   Geschwindigkeitsverteilung in Rohren." Zeitschrift für angewandte 
+ *   Reichardt, H. (1951). "Vollständige Darstellung der turbulenten
+ *   Geschwindigkeitsverteilung in Rohren." Zeitschrift für angewandte
  *   Mathematik und Mechanik, 31(7-8), 208-219.
  */
 #include <cmath>
 #include <algorithm>
 
-// Reichardt constants
-#define C_REICH 0.41
-#define A_DAMP 11.0
-#define B_EXP 3.0
-#define EXP_COEFF 7.8
+// Reichardt (1951) constants
+#define A_DAMP   11.0   // Damping length scale
+#define B_EXP     3.0   // Exponential decay scale
+#define EXP_COEFF 7.8   // Exponential amplitude
 
 /**
- * Dimensionless velocity u⁺ from dimensionless distance y⁺ 
- * using the original Reichardt (1951) formula.
+ * Dimensionless velocity u⁺ from dimensionless distance y⁺
+ * using the original two-term Reichardt (1951) formula.
+ *
+ *   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+ *
+ * Limiting behaviour:
+ *   - y⁺ → 0 : u⁺ → y⁺  (viscous sublayer recovered analytically)
+ *   - y⁺ → ∞ : u⁺ → (1/κ)*ln(y⁺) + B  (log law)
  */
 template<typename T>
 __device__ T reichardt_u_plus(const T y_plus, const T kappa) {
@@ -64,61 +74,68 @@ __device__ T reichardt_u_plus(const T y_plus, const T kappa) {
         return y_plus;
     }
 
-    // Linear term with damping: y⁺/(1 + y⁺/11)
-    T linear_term = y_plus / (1.0 + y_plus / A_DAMP);
-
-    // Logarithmic term: (1/κ)*ln(1 + 0.41*y⁺)
-    T log_arg = 1.0 + C_REICH * y_plus;
-    if (log_arg <= 0.0) {
-        return linear_term;
-    }
+    // Logarithmic term: (1/κ)*ln(1 + κ*y⁺)
+    T log_arg = 1.0 + kappa * y_plus;
     T log_term = (1.0 / kappa) * log(log_arg);
 
-    // Exponential correction term: 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+    // Exponential correction: 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
     T exp_term1 = exp(-y_plus / A_DAMP);
     T exp_term2 = (y_plus / A_DAMP) * exp(-y_plus / B_EXP);
 
-    // Total dimensionless velocity
-    T u_plus = linear_term + log_term + EXP_COEFF * (1.0 - exp_term1 - exp_term2);
-
-    return u_plus;
+    return log_term + EXP_COEFF * (1.0 - exp_term1 - exp_term2);
 }
 
 /**
- * Derivative du⁺/dy⁺ of the original Reichardt (1951) formula.
- * Used for Newton-Raphson iteration.
+ * Analytical derivative du⁺/dy⁺ of the original Reichardt (1951) formula.
+ *
+ * Derived from:
+ *   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+ *
+ * Giving:
+ *   du⁺/dy⁺ = 1/(1 + κ*y⁺)
+ *            + 7.8*[ (1/11)*exp(-y⁺/11)  -  (1/11)*exp(-y⁺/3)  +  (y⁺/33)*exp(-y⁺/3) ]
+ *
+ * Note: the sign of the last two exponential sub-terms is MINUS (they are
+ * grouped as exp_term2 = (1/11)*exp(-y/3) - (y/33)*exp(-y/3), so
+ * d_exp = 7.8*(exp_term1 - exp_term2)).
+ *
+ * Used in Newton-Raphson via:
+ *   dF/du_τ = u⁺ + u_τ * (du⁺/dy⁺) * (y/ν)
  */
 template<typename T>
 __device__ T reichardt_du_plus_dy(const T y_plus, const T kappa) {
     if (y_plus < 1.0e-12) {
-        return 1.0;
+        return 1.0;  // viscous sublayer: du⁺/dy⁺ = 1
     }
 
-    // Derivative of linear term: d/dy[y/(1 + y/11)] = 1/(1 + y/11)²
-    T d_linear = 1.0 / ((1.0 + y_plus / A_DAMP) * (1.0 + y_plus / A_DAMP));
+    // Derivative of log term: d/dy[(1/κ)*ln(1 + κ*y)] = 1/(1 + κ*y)
+    T log_arg = 1.0 + kappa * y_plus;
+    T d_log = 1.0 / log_arg;
 
-    // Derivative of log term: d/dy[(1/κ)*ln(1 + 0.41*y)]
-    T log_arg = 1.0 + C_REICH * y_plus;
-    if (log_arg <= 0.0) {
-        return d_linear;
-    }
-    T d_log = (1.0 / kappa) * C_REICH / log_arg;
-
-    // Derivative of exponential term:
-    // d/dy[7.8*(1 - exp(-y/11) - (y/11)*exp(-y/3))]
+    // Derivative of exponential correction:
+    //   d/dy[7.8*(1 - exp(-y/11) - (y/11)*exp(-y/3))]
+    // = 7.8*[ (1/11)*exp(-y/11)  -  (1/11)*exp(-y/3)  +  (y/33)*exp(-y/3) ]
+    //
+    // Grouping the last two terms into exp_term2:
+    //   exp_term2 = (1/11)*exp(-y/3) - (y/33)*exp(-y/3)
+    // so  d_exp = 7.8*(exp_term1 - exp_term2)   <-- MINUS sign
     T exp_term1 = exp(-y_plus / A_DAMP) / A_DAMP;
-    T exp_term2 = (1.0 / A_DAMP) * exp(-y_plus / B_EXP) - 
-                  (y_plus / A_DAMP) * (1.0 / B_EXP) * exp(-y_plus / B_EXP);
-    T d_exp = EXP_COEFF * (exp_term1 + exp_term2);
+    T exp_term2 = (1.0 / A_DAMP) * exp(-y_plus / B_EXP)
+                - (y_plus / A_DAMP) * (1.0 / B_EXP) * exp(-y_plus / B_EXP);
+    T d_exp = EXP_COEFF * (exp_term1 - exp_term2);
 
-    T du_dy = d_linear + d_log + d_exp;
-
-    return du_dy;
+    return d_log + d_exp;
 }
 
 /**
- * Newton-Raphson solver for friction velocity using original Reichardt law.
- * Solves the implicit equation: F(u_τ) = u_τ * u⁺(y⁺) - U = 0
+ * Newton-Raphson solver for friction velocity u_τ using the Reichardt law.
+ *
+ * Solves the implicit equation:
+ *   F(u_τ) = u_τ * u⁺(y⁺) - U = 0
+ * where y⁺ = y * u_τ / ν and U is the tangential velocity magnitude.
+ *
+ * Jacobian (chain rule through y⁺):
+ *   dF/du_τ = u⁺ + u_τ * (du⁺/dy⁺) * (y/ν)
  */
 template<typename T>
 __device__ T solve_reichardt(const T u, const T y, const T guess, const T nu,
@@ -131,18 +148,15 @@ __device__ T solve_reichardt(const T u, const T y, const T guess, const T nu,
     for (int k = 0; k < maxiter; ++k) {
         utau_old = utau;
 
-        // Current dimensionless coordinates
         y_plus = y * utau / nu;
         u_plus = reichardt_u_plus(y_plus, kappa);
-        du_dy = reichardt_du_plus_dy(y_plus, kappa);
+        du_dy  = reichardt_du_plus_dy(y_plus, kappa);
 
-        // Residual: F(u_τ) = u_τ * u⁺ - U
-        f = utau * u_plus - u;
-
-        // Sensitivity: dF/du_τ = u⁺ + u_τ * du⁺/dy⁺ * (y/ν)
+        // Residual and Jacobian
+        f  = utau * u_plus - u;
         df = u_plus + utau * du_dy * (y / nu);
 
-        // Safeguard against singular Jacobian
+        // Guard against near-zero Jacobian
         if (fabs(df) < 1.0e-14) {
             utau = utau * 0.99;
             continue;
@@ -151,15 +165,13 @@ __device__ T solve_reichardt(const T u, const T y, const T guess, const T nu,
         // Newton step
         utau = utau - f / df;
 
-        // Safeguard: prevent u_τ from becoming negative or zero
+        // Keep u_τ strictly positive
         if (utau <= 0.0) {
             utau = utau_old * 0.5;
         }
 
-        // Relative error check for convergence
+        // Convergence check on relative change
         error = fabs((utau - utau_old) / (utau + 1.0e-16));
-
-        // Convergence tolerance
         if (error < 1.0e-8) {
             break;
         }
@@ -169,7 +181,7 @@ __device__ T solve_reichardt(const T u, const T y, const T guess, const T nu,
 }
 
 /**
- * CUDA kernel for Reichardt's wall model.
+ * CUDA/HIP kernel for Reichardt's wall model.
  */
 template<typename T>
 __global__ void reichardt_compute(const T * __restrict__ u_d,
@@ -192,12 +204,12 @@ __global__ void reichardt_compute(const T * __restrict__ u_d,
                                   const T kappa,
                                   const T B,
                                   const int tstep) {
-                                    
+
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     const int str = blockDim.x * gridDim.x;
-    
+
     for (int i = idx; i < n_nodes; i += str) {
-        // Sample the velocity at the off-wall point
+        // Sample velocity at the off-wall point (Fortran-1 index offset)
         const int index = (ind_e_d[i] - 1) * lx * lx * lx +
                           (ind_t_d[i] - 1) * lx * lx +
                           (ind_s_d[i] - 1) * lx +
@@ -207,16 +219,14 @@ __global__ void reichardt_compute(const T * __restrict__ u_d,
         T vi = v_d[index];
         T wi = w_d[index];
 
-        // Load normal vectors and wall distance
-        T nx = n_x_d[i];
-        T ny = n_y_d[i];
-        T nz = n_z_d[i];
-        T h = h_d[i];
-        T nu = nu_d[i];
+        const T nx = n_x_d[i];
+        const T ny = n_y_d[i];
+        const T nz = n_z_d[i];
+        const T h  = h_d[i];
+        const T nu = nu_d[i];
 
-        // Project velocity onto tangential plane (remove normal component)
+        // Remove wall-normal component to get tangential velocity
         T normu = ui * nx + vi * ny + wi * nz;
-
         ui -= normu * nx;
         vi -= normu * ny;
         wi -= normu * nz;
@@ -224,13 +234,13 @@ __global__ void reichardt_compute(const T * __restrict__ u_d,
         // Magnitude of tangential velocity
         T magu = sqrt(ui * ui + vi * vi + wi * wi);
 
-        // Get initial guess for Newton solver
+        // Initial guess for Newton solver
         T guess;
         if (tstep == 1) {
-            // First time-step: use simple estimate
+            // First time-step: laminar sublayer estimate
             guess = sqrt(magu * nu / h);
         } else {
-            // Use previous solution as starting point
+            // Warm start from previous shear stress magnitude
             T tau_mag_sq = tau_x_d[i] * tau_x_d[i] +
                            tau_y_d[i] * tau_y_d[i] +
                            tau_z_d[i] * tau_z_d[i];
@@ -240,14 +250,13 @@ __global__ void reichardt_compute(const T * __restrict__ u_d,
         // Solve for friction velocity u_tau
         T utau = solve_reichardt(magu, h, guess, nu, kappa);
 
-        // Distribute shear stress according to velocity direction
-        // tau_wall = -ρ * u_tau² * (u_tangential / |u_tangential|)
+        // Distribute shear stress in the tangential velocity direction
+        // tau_wall = -u_tau² * (u_tangential / |u_tangential|)
         if (magu > 1.0e-14) {
             tau_x_d[i] = -utau * utau * ui / magu;
             tau_y_d[i] = -utau * utau * vi / magu;
             tau_z_d[i] = -utau * utau * wi / magu;
         } else {
-            // Avoid division by zero when velocity is zero
             tau_x_d[i] = 0.0;
             tau_y_d[i] = 0.0;
             tau_z_d[i] = 0.0;

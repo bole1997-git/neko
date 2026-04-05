@@ -34,13 +34,15 @@ submodule (wall_model) wall_model_fctry
   use reichardt, only : reichardt_t
   use rough_log_law, only : rough_log_law_t
   use spalding, only : spalding_t
+  use duprat, only : duprat_t
   use utils, only : neko_type_error
   use utils, only : neko_type_registration_error
   implicit none
 
   ! List of all possible types created by the factory routine
   ! Types listed in alphabetical order
-  character(len=20) :: WALLM_KNOWN_TYPES(3) = [character(len=20) :: &
+  character(len=20) :: WALLM_KNOWN_TYPES(4) = [character(len=20) :: &
+       "duprat", &
        "reichardt", &
        "rough_log_law", &
        "spalding"]
@@ -91,6 +93,8 @@ contains
     end if
 
     select case (trim(type_name) )
+    case ("duprat")
+       allocate(duprat_t::object)
     case ("reichardt")
        allocate(reichardt_t::object)
     case ("rough_log_law")
