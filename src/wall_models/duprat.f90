@@ -32,12 +32,12 @@
 !
 !> Implements `duprat_t`.
 !!
-!! Wall model based on Duprat et al. (2011) extended law of the wall
-!! for turbulent flows with/without streamwise pressure gradient.
+!! Wall model based on Duprat et al. (2011) extended law of the wall.
 !!
 !! ## Physics
 !!
-!!   u_P   = (nu * |dP/dx| / (2*rho))^(1/3)     [Simpson velocity scale; rho=1]
+!!   rho   = 1  (non-dimensional; hard-coded per problem setup)
+!!   u_P   = (nu * |dP/dx| / 2)^(1/3)           [Simpson velocity scale]
 !!   u_p*  = sqrt(u_tau^2 + u_P^2)
 !!   alpha = u_tau^2 / u_p*^2  in [0, 1]
 !!   y*    = y * u_p*/nu,   U* = U/u_p*
@@ -47,44 +47,82 @@
 !! ## Pressure gradient modes
 !!
 !! **CPG** (`use_constant_dpdx: true`, default):
-!!   Uses `dpdx_constant` [Pa/m] uniformly. Set to 0 for ZPG.
+!!   Uniform scalar `dpdx_constant` [Pa/m] at every wall node. Set to 0 for ZPG.
 !!
 !! **APG** (`use_constant_dpdx: false`):
-!!   Extracts the VOLUME-AVERAGED streamwise pressure gradient from the
-!!   resolved pressure field `p` at every timestep.
+!!   Per-node temporally filtered local streamwise pressure gradient.
 !!
-!!   ### Why volume-average and not pointwise?
+!! ## APG framework design
 !!
-!!   The pressure field p in LES contains both the mean gradient AND
-!!   turbulent pressure fluctuations of magnitude p_rms ~ 3 u_tau^2.
-!!   The fluctuation gradient nabla(p_fluct) has random signs per GLL node.
-!!   For nodes where sign(dp_fluct/dx) = -1 (apparent FPG), the Duprat ODE
-!!   numerator sign(dP/dx)*(1-alpha)^1.5*y* + 1 becomes negative for
-!!   y* > 1/(1-alpha)^1.5 ~ 8, making U*(y*) non-monotone. The Newton
-!!   solver then either diverges or converges to a spurious root, producing
-!!   a wrong utau -> wrong tau -> velocity blow-up.
+!! Three structural problems caused all previous blow-ups, each addressed here:
 !!
-!!   The MEAN pressure gradient has a definite, physically correct sign
-!!   and does not cause this problem.
+!! ### Problem A — Gradient timing
 !!
-!!   ### Formula (MPI-parallel, exact)
+!!   `compute()` is called from the Momentum Krylov solver. At step N's
+!!   first call, the pnpn ordering (Pressure solve -> Velocity correct ->
+!!   Momentum solve) means `p` in the registry is the CONVERGED step-N
+!!   pressure. Using `dudxyz(p_N)` during step N gives the current-step's
+!!   gradient, which can be large during turbulent transition even after
+!!   the previous step was stable.
 !!
-!!   opgrad returns the weak-form (B-weighted) gradient:
-!!     gx(i) = B_i * (dp/dx)_i,   B_i = J_i * w_i  (= coef%B)
+!!   FIX: double-buffer the gradient.
+!!     grad_px/py/pz     = gradient from p_{N-1} (PREVIOUS step, safe to use)
+!!     grad_px_buf/...   = gradient from p_N (CURRENT step, stored for next step)
 !!
-!!   The volume-weighted mean streamwise gradient is then:
-!!     dP_mean/dx = sum_i(gx_i) / sum_i(B_i)
-!!               = glsum(gx, n) / glsum(coef%B, n)
+!!   At step N's first call:
+!!     1. Use grad_px (= p_{N-1} gradient) to update the IIR filter.
+!!     2. Compute dudxyz(p_N) -> grad_px_buf.
+!!     3. Copy buf -> active: grad_px <- grad_px_buf.
+!!     4. Record grad_tstep = tstep.
 !!
-!!   glsum performs MPI_Allreduce, giving the GLOBAL volume average.
-!!   No pointwise division by B is needed — the B factors cancel.
+!!   This guarantees the filter always operates on a one-step-lagged,
+!!   previously-converged pressure gradient.
 !!
-!!   ### Behaviour in a body-force-driven channel
+!! ### Problem B — Filter warm-up during transition
 !!
-!!   When flow_rate_force drives the channel, the mean dP/dx is absorbed
-!!   into the body force, so opgrad(p) gives fluctuations only ->
-!!   dP_mean/dx ~ 0 -> u_P ~ 0 -> alpha ~ 1 -> ZPG Duprat (Van Driest).
-!!   This is physically correct for a statistically stationary channel.
+!!   For t < t_filter_start, the flow is in turbulent transition. The
+!!   pressure field has physically meaningless transient values. Accumulating
+!!   the IIR filter during this period seeds it with garbage, which compounds
+!!   over many steps even with the Stokes clamp active.
+!!
+!!   FIX: the `t_filter_start` parameter (JSON, default 5.0 outer time units).
+!!     t <  t_filter_start: dpdx_filt(:) = 0 (ZPG), filter NOT updated.
+!!     t >= t_filter_start: IIR filter accumulates normally.
+!!
+!!   The double-buffer IS updated every step regardless, so at t_filter_start
+!!   the filter immediately has access to a correct, recent p_{N-1} gradient.
+!!
+!!   Default t_filter_start = 5.0 ensures transition is complete before the
+!!   APG correction activates. The model runs as ZPG Duprat (Van Driest)
+!!   during transition — physically correct and numerically stable.
+!!
+!! ### Problem C — Inexact dt
+!!
+!!   Previous code estimated dt = t/(tstep-1), giving the MEAN dt, not the
+!!   current dt. For variable-timestep runs, this gives wrong beta_f.
+!!
+!!   FIX: store `t_prev` as a type member. Exact dt = t - t_prev.
+!!
+!! ### Clamp (secondary defence)
+!!
+!!   Stokes-based self-consistent clamp applied to dpdx_local before the
+!!   filter update:
+!!
+!!     max_dpdx = 2 * (magu * nu / h)^(3/2) / nu
+!!
+!!   Derived by setting u_P_max = u_tau_stokes = sqrt(magu*nu/h) and
+!!   inverting the Simpson scale. When clamped, alpha >= 0.5 is guaranteed,
+!!   keeping the ODE numerator positive and Newton convergent.
+!!
+!! ## JSON parameters
+!!
+!!   kappa            : real    (default 0.41)
+!!   beta             : real    (default 0.78)
+!!   A                : real    (default 17.0)
+!!   use_constant_dpdx: logical (default .true.)
+!!   dpdx_constant    : real    (default 0.0  [Pa/m])
+!!   t_filter_start   : real    (default 5.0  [outer time units])
+!!   t_filter         : real    (default 1.0  [outer time units])
 !!
 !! ## Reference
 !!   Duprat, C., Balarac, G., Metais, O., Congedo, P. M., and Brugiere, O.
@@ -101,33 +139,47 @@ module duprat
   use json_utils, only: json_get_or_lookup, json_get_or_default
   use field_math, only: field_invcol3
   use vector, only: vector_t
-  use math, only: masked_gather_copy_0, glsum
+  use math, only: masked_gather_copy_0
   use device_math, only: device_masked_gather_copy_0
   use scratch_registry, only: neko_scratch_registry
-  use operators, only: opgrad
-  use duprat_cpu, only: duprat_compute_cpu
+  use operators, only: dudxyz
+  use duprat_cpu, only: duprat_compute_cpu, duprat_compute_apg_cpu
   use utils, only: neko_error
 
   implicit none
   private
 
-  !> Duprat (2011) wall model.
-  !!
-  !! JSON keys:
-  !!   kappa              (real, default 0.41)
-  !!   beta               (real, default 0.78)
-  !!   A                  (real, default 17.0)
-  !!   use_constant_dpdx  (logical, default .true.)
-  !!   dpdx_constant      (real, default 0.0 [Pa/m])
-  !!
   type, public, extends(wall_model_t) :: duprat_t
+     ! Model constants
      real(kind=rp) :: kappa = 0.41_rp
      real(kind=rp) :: beta  = 0.78_rp
      real(kind=rp) :: A     = 17.0_rp
+     ! Mode
      logical        :: use_constant_dpdx = .true.
      real(kind=rp) :: dpdx_const = 0.0_rp
+     ! APG filter parameters
+     real(kind=rp) :: t_filter_start = 5.0_rp  ! start filter at this time
+     real(kind=rp) :: t_filter       = 1.0_rp  ! IIR time scale
+     ! Nu and rho at wall nodes
      type(vector_t) :: nu
      type(vector_t) :: rho_w
+     ! Per-node IIR filtered streamwise pressure gradient [Pa/m]
+     ! Zero until t >= t_filter_start. Converges to local mean afterwards.
+     real(kind=rp), allocatable :: dpdx_filt(:)
+     ! ACTIVE gradient arrays: hold grad(p_{N-1}) — the PREVIOUS step's gradient.
+     ! Safe to use for the filter update at step N.
+     real(kind=rp), allocatable :: grad_px(:,:,:,:)
+     real(kind=rp), allocatable :: grad_py(:,:,:,:)
+     real(kind=rp), allocatable :: grad_pz(:,:,:,:)
+     ! BUFFER gradient arrays: hold grad(p_N) — the CURRENT step's gradient.
+     ! Computed at step N's first call. Promoted to active at step N+1.
+     real(kind=rp), allocatable :: grad_px_buf(:,:,:,:)
+     real(kind=rp), allocatable :: grad_py_buf(:,:,:,:)
+     real(kind=rp), allocatable :: grad_pz_buf(:,:,:,:)
+     ! Krylov guard: fires update on FIRST call per timestep only
+     integer        :: grad_tstep = 0
+     ! Previous time for exact dt computation
+     real(kind=rp) :: t_prev = -1.0_rp   ! -1 signals "first call ever"
    contains
      procedure, pass(this) :: init              => duprat_init
      procedure, pass(this) :: partial_init      => duprat_partial_init
@@ -150,17 +202,19 @@ contains
     type(coef_t),     intent(in)   :: coef
     integer,          intent(in)   :: msk(:), facet(:), h_index
     type(json_file),  intent(inout):: json
-    real(kind=rp) :: kappa, beta, A, dpdx_const
+    real(kind=rp) :: kappa, beta, A, dpdx_const, t_filter_start, t_filter
     logical       :: use_constant_dpdx
 
     call json_get_or_lookup(json, "kappa", kappa)
     call json_get_or_lookup(json, "beta",  beta)
     call json_get_or_lookup(json, "A",     A)
     call json_get_or_default(json, "use_constant_dpdx", use_constant_dpdx, .true.)
-    call json_get_or_default(json, "dpdx_constant",     dpdx_const, 0.0_rp)
+    call json_get_or_default(json, "dpdx_constant",     dpdx_const,      0.0_rp)
+    call json_get_or_default(json, "t_filter_start",    t_filter_start,  5.0_rp)
+    call json_get_or_default(json, "t_filter",          t_filter,        1.0_rp)
 
     call this%init_from_components(scheme_name, coef, msk, facet, h_index, &
-         kappa, beta, A, use_constant_dpdx, dpdx_const)
+         kappa, beta, A, use_constant_dpdx, dpdx_const, t_filter_start, t_filter)
   end subroutine duprat_init
 
   subroutine duprat_partial_init(this, coef, json)
@@ -173,26 +227,55 @@ contains
     call json_get_or_lookup(json, "beta",  this%beta)
     call json_get_or_lookup(json, "A",     this%A)
     call json_get_or_default(json, "use_constant_dpdx", this%use_constant_dpdx, .true.)
-    call json_get_or_default(json, "dpdx_constant",     this%dpdx_const, 0.0_rp)
+    call json_get_or_default(json, "dpdx_constant",     this%dpdx_const,      0.0_rp)
+    call json_get_or_default(json, "t_filter_start",    this%t_filter_start,  5.0_rp)
+    call json_get_or_default(json, "t_filter",          this%t_filter,        1.0_rp)
   end subroutine duprat_partial_init
 
   subroutine duprat_finalize(this, msk, facet)
     class(duprat_t), intent(inout) :: this
     integer,         intent(in)    :: msk(:), facet(:)
+    integer :: lx, nelv
 
     call this%finalize_base(msk, facet)
     call this%nu%init(this%n_nodes)
     call this%rho_w%init(this%n_nodes)
+    this%grad_tstep = 0
+    this%t_prev     = -1.0_rp
+
+    if (.not. this%use_constant_dpdx) then
+       lx   = this%coef%Xh%lx
+       nelv = this%coef%msh%nelv
+       allocate(this%dpdx_filt   (this%n_nodes))
+       allocate(this%grad_px     (lx, lx, lx, nelv))
+       allocate(this%grad_py     (lx, lx, lx, nelv))
+       allocate(this%grad_pz     (lx, lx, lx, nelv))
+       allocate(this%grad_px_buf (lx, lx, lx, nelv))
+       allocate(this%grad_py_buf (lx, lx, lx, nelv))
+       allocate(this%grad_pz_buf (lx, lx, lx, nelv))
+       this%dpdx_filt    = 0.0_rp
+       this%grad_px      = 0.0_rp
+       this%grad_py      = 0.0_rp
+       this%grad_pz      = 0.0_rp
+       this%grad_px_buf  = 0.0_rp
+       this%grad_py_buf  = 0.0_rp
+       this%grad_pz_buf  = 0.0_rp
+    end if
   end subroutine duprat_finalize
 
+  ! NOTE: init_from_components must allocate APG arrays too because
+  ! init_base calls finalize_base only, NOT the child duprat_finalize.
   subroutine duprat_init_from_components(this, scheme_name, coef, msk, &
-       facet, h_index, kappa, beta, A, use_constant_dpdx, dpdx_const)
+       facet, h_index, kappa, beta, A, use_constant_dpdx, dpdx_const, &
+       t_filter_start, t_filter)
     class(duprat_t), intent(inout) :: this
     character(len=*), intent(in)   :: scheme_name
     type(coef_t),     intent(in)   :: coef
     integer,          intent(in)   :: msk(:), facet(:), h_index
     real(kind=rp),    intent(in)   :: kappa, beta, A, dpdx_const
+    real(kind=rp),    intent(in)   :: t_filter_start, t_filter
     logical,          intent(in)   :: use_constant_dpdx
+    integer :: lx, nelv
 
     call this%free()
     call this%init_base(scheme_name, coef, msk, facet, h_index)
@@ -202,9 +285,32 @@ contains
     this%A                 = A
     this%use_constant_dpdx = use_constant_dpdx
     this%dpdx_const        = dpdx_const
+    this%t_filter_start    = t_filter_start
+    this%t_filter          = t_filter
+    this%grad_tstep        = 0
+    this%t_prev            = -1.0_rp
 
     call this%nu%init(this%n_nodes)
     call this%rho_w%init(this%n_nodes)
+
+    if (.not. this%use_constant_dpdx) then
+       lx   = this%coef%Xh%lx
+       nelv = this%coef%msh%nelv
+       allocate(this%dpdx_filt   (this%n_nodes))
+       allocate(this%grad_px     (lx, lx, lx, nelv))
+       allocate(this%grad_py     (lx, lx, lx, nelv))
+       allocate(this%grad_pz     (lx, lx, lx, nelv))
+       allocate(this%grad_px_buf (lx, lx, lx, nelv))
+       allocate(this%grad_py_buf (lx, lx, lx, nelv))
+       allocate(this%grad_pz_buf (lx, lx, lx, nelv))
+       this%dpdx_filt    = 0.0_rp
+       this%grad_px      = 0.0_rp
+       this%grad_py      = 0.0_rp
+       this%grad_pz      = 0.0_rp
+       this%grad_px_buf  = 0.0_rp
+       this%grad_py_buf  = 0.0_rp
+       this%grad_pz_buf  = 0.0_rp
+    end if
   end subroutine duprat_init_from_components
 
   subroutine duprat_free(this)
@@ -212,6 +318,13 @@ contains
     call this%free_base()
     call this%nu%free()
     call this%rho_w%free()
+    if (allocated(this%dpdx_filt   )) deallocate(this%dpdx_filt   )
+    if (allocated(this%grad_px     )) deallocate(this%grad_px     )
+    if (allocated(this%grad_py     )) deallocate(this%grad_py     )
+    if (allocated(this%grad_pz     )) deallocate(this%grad_pz     )
+    if (allocated(this%grad_px_buf )) deallocate(this%grad_px_buf )
+    if (allocated(this%grad_py_buf )) deallocate(this%grad_py_buf )
+    if (allocated(this%grad_pz_buf )) deallocate(this%grad_pz_buf )
   end subroutine duprat_free
 
   ! ===========================================================================
@@ -224,7 +337,7 @@ contains
     integer :: idx
 
     call neko_scratch_registry%request_field(temp, idx, .false.)
-    call field_invcol3(temp, this%mu, this%rho)   ! temp = mu/rho = nu
+    call field_invcol3(temp, this%mu, this%rho)
 
     if (NEKO_BCKND_DEVICE .eq. 1) then
        call device_masked_gather_copy_0(this%nu%x_d, temp%x_d, this%msk_d, &
@@ -247,30 +360,45 @@ contains
 
   !> Compute wall shear stress using the Duprat (2011) model.
   !!
-  !! **CPG path**: passes `dpdx_const` directly to the kernel. Fast, no
-  !! pressure field access.
+  !! **CPG path** (`use_constant_dpdx = .true.`):
+  !!   Passes `dpdx_const` directly to the kernel. No field access.
   !!
-  !! **APG path**: computes the global volume-averaged streamwise pressure
-  !! gradient from the resolved pressure field `p`:
+  !! **APG path** (`use_constant_dpdx = .false.`):
   !!
-  !!   1. opgrad(gx, gy_dummy, gy_dummy, p, coef) -> gx = B*(dp/dx)
-  !!      (we reuse gy_dummy for y and z outputs; those values are not used)
-  !!   2. dP_mean/dx = glsum(gx, n) / glsum(coef%B, n)
-  !!      Both glsum calls perform MPI_Allreduce => global result.
-  !!   3. This single scalar is passed uniformly to every wall node.
+  !!   Gated by `grad_tstep` to fire EXACTLY ONCE per timestep.
+  !!   On the first call of step N:
   !!
-  !! The volume-average eliminates turbulent fluctuation gradients that have
-  !! random signs per node and would make the Duprat ODE non-monotone.
+  !!   Step 1 — compute exact dt:
+  !!     if t_prev < 0: dt = t  (first ever call)
+  !!     else:          dt = t - t_prev  (exact, not mean)
   !!
-  !! Note: compute_mag_field() is NOT called here; wall_model_bc does it.
+  !!   Step 2 — IIR filter update (only if t >= t_filter_start):
+  !!     For each wall node i, using the ACTIVE gradient (= grad(p_{N-1})):
+  !!       dpdx_local = grad_px[ind_r,ind_s,ind_t,ind_e] * (ui/magu)
+  !!                  + grad_py[...] * (vi/magu)
+  !!                  + grad_pz[...] * (wi/magu)
+  !!       Clamp: |dpdx_local| <= 2*(magu*nu/h)^1.5/nu   [Stokes bound]
+  !!       beta_f = min(dt/t_filter, 0.5)
+  !!       dpdx_filt[i] = (1-beta_f)*dpdx_filt[i] + beta_f*dpdx_local
+  !!
+  !!     If t < t_filter_start: dpdx_filt stays at 0 (ZPG, no update).
+  !!
+  !!   Step 3 — update double-buffer (ALWAYS, regardless of t_filter_start):
+  !!     Compute dudxyz(p_N) -> grad_px_buf/py_buf/pz_buf   [current step's grad]
+  !!     grad_px <- grad_px_buf                              [promote: now p_{N-1} for N+1]
+  !!     grad_py <- grad_py_buf
+  !!     grad_pz <- grad_pz_buf
+  !!     t_prev = t,  grad_tstep = tstep
+  !!
+  !!   Note: `compute_mag_field()` is NOT called here; wall_model_bc does it.
   subroutine duprat_compute(this, t, tstep)
     class(duprat_t), intent(inout) :: this
     real(kind=rp),   intent(in)    :: t
     integer,         intent(in)    :: tstep
     type(field_t), pointer :: u, v, w, p
-    type(field_t), pointer :: gx, gy_dummy
-    integer       :: idx_gx, idx_gy, n_total
-    real(kind=rp) :: dpdx_apg
+    integer       :: i
+    real(kind=rp) :: ui, vi, wi, normu, magu, dpdx_local, beta_f, dt
+    real(kind=rp) :: max_dpdx_local
 
     call this%compute_nu()
 
@@ -292,54 +420,112 @@ contains
             this%nu%x, this%rho_w%x, this%h%x, &
             this%tau_x%x, this%tau_y%x, this%tau_z%x, &
             this%n_nodes, u%Xh%lx, u%msh%nelv, &
-            this%kappa, this%beta, this%A, this%dpdx_const, tstep)
+            this%kappa, this%beta, this%A, this%dpdx_const)
 
     else
 
-       ! ---- APG path: volume-averaged mean streamwise pressure gradient ------
+       ! ---- APG path --------------------------------------------------------
        !
-       ! opgrad(gx, gy, gz, p, coef) computes the WEAK-form gradient:
-       !   gx_i = B_i * (dp/dx)_i
-       !   gy_i = B_i * (dp/dy)_i
-       !   gz_i = B_i * (dp/dz)_i
-       !
-       ! We only need gx for the volume average. To avoid allocating a third
-       ! scratch field for gz, we pass gy_dummy for both the y and z outputs.
-       ! The Neko CPU opgrad backend writes each component in a separate
-       ! loop, so the final content of gy_dummy is B*(dp/dz) (last write),
-       ! which we discard. gx is unaffected.
-       !
-       ! Volume-averaged mean:
-       !   dP_mean/dx = sum_i[B_i*(dp/dx)_i] / sum_i[B_i]
-       !              = glsum(gx, n) / glsum(B, n)
-       !
-       ! glsum performs MPI_Allreduce: result is globally consistent.
-       ! The B factors cancel exactly — no pointwise division needed.
+       ! Gate: fire ONCE per timestep (first Krylov call only).
+       ! On subsequent calls: reuse dpdx_filt unchanged.
+       if (tstep .ne. this%grad_tstep) then
 
-       p => neko_registry%get_field("p")
-       n_total = this%coef%Xh%lxyz * this%coef%msh%nelv
+          ! --- Step 1: exact dt ---
+          if (this%t_prev < 0.0_rp) then
+             dt = t             ! very first call ever; t ≈ first dt
+          else
+             dt = t - this%t_prev
+          end if
+          dt = max(dt, 1.0e-14_rp)   ! guard against zero or negative dt
 
-       call neko_scratch_registry%request_field(gx,       idx_gx,  .false.)
-       call neko_scratch_registry%request_field(gy_dummy, idx_gy,   .false.)
+          ! --- Step 2: IIR filter update ---
+          ! Uses the ACTIVE gradient arrays = grad(p_{N-1}).
+          ! At the very first call (tstep=1), the active arrays are zero
+          ! (initialised in finalize/init_from_components), so dpdx_local=0
+          ! and dpdx_filt stays 0. This is correct: ZPG on the first step.
+          if (t >= this%t_filter_start) then
 
-       ! Weak-form gradient: gx <- B*(dp/dx),  gy_dummy <- B*(dp/dz) [discarded]
-       call opgrad(gx%x, gy_dummy%x, gy_dummy%x, p%x, this%coef)
+             beta_f = min(dt / max(this%t_filter, 1.0e-14_rp), 0.5_rp)
 
-       ! Global volume-weighted mean streamwise pressure gradient
-       dpdx_apg = glsum(gx%x, n_total) / glsum(this%coef%B, n_total)
+             do i = 1, this%n_nodes
+                ! Sample velocity at off-wall point; project out normal component.
+                ui = u%x(this%ind_r(i), this%ind_s(i), this%ind_t(i), this%ind_e(i))
+                vi = v%x(this%ind_r(i), this%ind_s(i), this%ind_t(i), this%ind_e(i))
+                wi = w%x(this%ind_r(i), this%ind_s(i), this%ind_t(i), this%ind_e(i))
+                normu = ui*this%n_x%x(i) + vi*this%n_y%x(i) + wi*this%n_z%x(i)
+                ui = ui - normu*this%n_x%x(i)
+                vi = vi - normu*this%n_y%x(i)
+                wi = wi - normu*this%n_z%x(i)
+                magu = sqrt(ui**2 + vi**2 + wi**2)
 
-       call neko_scratch_registry%relinquish_field(idx_gx)
-       call neko_scratch_registry%relinquish_field(idx_gy)
+                if (magu <= 1.0e-14_rp) cycle  ! leave dpdx_filt unchanged
 
-       ! Pass the single scalar to the kernel (same as CPG path).
-       call duprat_compute_cpu( &
+                ! Project PREVIOUS step's gradient onto tangential direction.
+                dpdx_local = &
+                     this%grad_px( &
+                          this%ind_r(i),this%ind_s(i),this%ind_t(i),this%ind_e(i)) &
+                     * (ui/magu) &
+                     + this%grad_py( &
+                          this%ind_r(i),this%ind_s(i),this%ind_t(i),this%ind_e(i)) &
+                     * (vi/magu) &
+                     + this%grad_pz( &
+                          this%ind_r(i),this%ind_s(i),this%ind_t(i),this%ind_e(i)) &
+                     * (wi/magu)
+
+                ! Stokes self-consistent clamp (last-resort guard):
+                ! Ensures u_P <= u_tau_stokes -> alpha >= 0.5 when clamped.
+                max_dpdx_local = 2.0_rp &
+                     * (magu * this%nu%x(i) / this%h%x(i))**1.5_rp &
+                     / this%nu%x(i)
+                dpdx_local = sign(min(abs(dpdx_local), max_dpdx_local), dpdx_local)
+
+                ! IIR exponential moving average.
+                this%dpdx_filt(i) = (1.0_rp - beta_f) * this%dpdx_filt(i) &
+                                  + beta_f * dpdx_local
+             end do
+
+          else
+             ! t < t_filter_start: zero the filter (ZPG, no update).
+             this%dpdx_filt(:) = 0.0_rp
+          end if
+
+          ! --- Step 3: update double-buffer (ALWAYS) ---
+          !
+          ! Compute grad(p_N) -> buffer. Then promote buffer -> active.
+          ! After this, grad_px/py/pz = grad(p_N) which becomes
+          ! grad(p_{N-1}) for the next timestep's filter update.
+          !
+          ! This uses the CURRENT step's converged pressure (p_N), stored
+          ! as the lagged gradient for step N+1.
+          p => neko_registry%get_field("p")
+
+          call dudxyz(this%grad_px_buf, p%x, &
+               this%coef%drdx, this%coef%dsdx, this%coef%dtdx, this%coef)
+          call dudxyz(this%grad_py_buf, p%x, &
+               this%coef%drdy, this%coef%dsdy, this%coef%dtdy, this%coef)
+          call dudxyz(this%grad_pz_buf, p%x, &
+               this%coef%drdz, this%coef%dsdz, this%coef%dtdz, this%coef)
+
+          ! Promote buffer -> active (simple array copy; avoids pointer aliasing).
+          this%grad_px = this%grad_px_buf
+          this%grad_py = this%grad_py_buf
+          this%grad_pz = this%grad_pz_buf
+
+          this%t_prev     = t
+          this%grad_tstep = tstep
+
+       end if  ! end of first-call-only block
+
+       ! Call APG kernel with per-node filtered gradient.
+       call duprat_compute_apg_cpu( &
             u%x, v%x, w%x, &
             this%ind_r, this%ind_s, this%ind_t, this%ind_e, &
             this%n_x%x, this%n_y%x, this%n_z%x, &
             this%nu%x, this%rho_w%x, this%h%x, &
             this%tau_x%x, this%tau_y%x, this%tau_z%x, &
             this%n_nodes, u%Xh%lx, u%msh%nelv, &
-            this%kappa, this%beta, this%A, dpdx_apg, tstep)
+            this%kappa, this%beta, this%A, &
+            this%dpdx_filt)
 
     end if
 
