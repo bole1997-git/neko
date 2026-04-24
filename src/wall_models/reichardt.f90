@@ -33,14 +33,15 @@
 !> Implements `reichardt_t`.
 !! Wall model based on the original Reichardt (1951) two-term law of the wall:
 !!
-!!   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
+!!   u+ = (1/kappa)*ln(1 + kappa*y+)
+!!      + 7.8*[1 - exp(-y+/11) - (y+/11)*exp(-y+/3)]
 !!
 !! This formula continuously covers the viscous sublayer, buffer layer, and
 !! logarithmic region without piecewise switching.
 !!
 !! Reference:
-!!   Reichardt, H. (1951). "Vollständige Darstellung der turbulenten
-!!   Geschwindigkeitsverteilung in Rohren." Zeitschrift für angewandte
+!!   Reichardt, H. (1951). "Vollstandige Darstellung der turbulenten
+!!   Geschwindigkeitsverteilung in Rohren." Zeitschrift fur angewandte
 !!   Mathematik und Mechanik, 31(7-8), 208-219.
 !!
 module reichardt
@@ -68,7 +69,7 @@ module reichardt
   !! but is not used in the Reichardt formula itself (which sets its own
   !! log-law intercept implicitly through the exponential correction term).
   type, public, extends(wall_model_t) :: reichardt_t
-     !> The von Kármán constant.
+     !> The von Karman constant.
      real(kind=rp) :: kappa = 0.41_rp
      !> Log-law intercept (not used in Reichardt formula; kept for API compatibility).
      real(kind=rp) :: B = 5.2_rp
@@ -156,8 +157,6 @@ contains
   end subroutine reichardt_init_from_components
 
   !> Compute the kinematic viscosity vector at wall boundary nodes.
-  !! Evaluates ν = μ/ρ at each boundary node and gathers it into the
-  !! compact wall-node array this%nu.
   subroutine reichardt_compute_nu(this)
     class(reichardt_t), intent(inout) :: this
     type(field_t), pointer :: temp
@@ -185,8 +184,12 @@ contains
 
   !> Compute the wall shear stress using the Reichardt (1951) law.
   !!
-  !! Calls reichardt_compute_cpu on CPU backends. GPU support is not yet
-  !! implemented.
+  !! Calls reichardt_compute_cpu on CPU backends.
+  !! GPU support is not yet implemented.
+  !!
+  !! Note: compute_mag_field() is intentionally NOT called here.
+  !! The wall_model_bc driver calls it after every compute() for all
+  !! wall models. Calling it here would cause a spurious double invocation.
   subroutine reichardt_compute(this, t, tstep)
     class(reichardt_t), intent(inout) :: this
     real(kind=rp), intent(in) :: t
@@ -212,8 +215,6 @@ contains
             this%n_nodes, u%Xh%lx, u%msh%nelv, &
             this%kappa, this%B, tstep)
     end if
-
-    call this%compute_mag_field()
 
   end subroutine reichardt_compute
 
