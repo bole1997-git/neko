@@ -33,86 +33,78 @@
 !> Implements `duprat_t`.
 !!
 !! Wall model based on Duprat et al. (2011) extended law of the wall.
+!! Reference: Duprat, C., Balarac, G., Metais, O., Congedo, P. M., and
+!!   Brugiere, O. (2011). Physics of Fluids, 23(1), 015101.
 !!
-!! ## Physics
+!! ## Fixes applied (cumulative)
 !!
-!!   rho   = 1  (non-dimensional; hard-coded per problem setup)
-!!   u_P   = (nu * |dP/dx| / 2)^(1/3)           [Simpson velocity scale]
-!!   u_p*  = sqrt(u_tau^2 + u_P^2)
-!!   alpha = u_tau^2 / u_p*^2  in [0, 1]
-!!   y*    = y * u_p*/nu,   U* = U/u_p*
-!!   nu_t* = (kappa*y* + beta*y*(1-alpha)^1.5)*(1-exp(-y*/(1+A*alpha^3)))^2
-!!   dU*/dy* = [sign(dP/dx)*(1-alpha)^1.5*y* + 1] / (1 + nu_t*)
+!! FIX 1 -- rho_w removed from kernel calls.
+!!   Neko's pressure field is kinematic (p/rho). Duprat u_P is also
+!!   kinematic. Passing rho_w into the kernel caused a second division
+!!   by rho, making u_P too small by rho^(1/3) and breaking the model
+!!   for any rho /= 1. rho_w is still gathered (for future use) but
+!!   no longer passed to solve_duprat.
+!!
+!! FIX 2 -- Wall-tangential gradient magnitude replaces velocity projection.
+!!   Old: dpdx_local = grad_p . (u_tang/|u_tang|)
+!!   Problem: this quantity flips sign in recirculation zones (u reverses),
+!!   giving wrong APG/FPG diagnosis inside the separation bubble.
+!!   New: dpdx_local = |grad_p - (grad_p . n)*n|  [tangential magnitude]
+!!   Sign recovered from dot of tangential gradient with flow direction.
+!!
+!! FIX 3 -- Stokes clamp removed from APG kernel.
+!!   Applied ONCE in the filter update loop only. Double-clamping with
+!!   different magu values (filter vs. kernel) falsely zeros valid gradients.
+!!
+!! FIX 4 -- Restart-safe dt computation.
+!!   dt = 0 on the very first call (skip filter update), then
+!!   dt = t - t_prev for all subsequent steps.
+!!
+!! FIX 5,6,7 -- In duprat_cpu.f90 (GL-5 quadrature, relaxed tolerance,
+!!   warm Newton guess).
+!!
+!! FIX 8 -- Buffer guard: dudxyz only called within one t_filter window
+!!   before t_filter_start. Prevents stale fully-turbulent gradient from
+!!   causing step change in tau_w at filter activation.
+!!
+!! FIX 9 -- beta_f linear ramp over first t_filter window after activation.
+!!   Scales beta_f from 0 to full value linearly, preventing step change
+!!   in tau_w when APG activates.
+!!
+!! FIX 10 -- Jacobian correction after dudxyz.
+!!   dudxyz(du, u, drdx, dsdx, dtdx, coef) computes:
+!!     du = (1/J) * (drdx*D_r(u) + dsdx*D_s(u) + dtdx*D_t(u))
+!!   because cpu_dudxyz multiplies by coef%jacinv = 1/J internally.
+!!   This gives (1/J)*dp/dx, NOT dp/dx.
+!!   On curved geometries (periodic hill), J varies by factors of 2-5
+!!   near the wall surface. Without correction, dpdx_local is wrong by
+!!   the same factor, giving wrong u_P and causing blow-up when APG
+!!   activates (observed: CFL explosion at t=110.5 on Fritz).
+!!   Fix: multiply each grad buffer by coef%jac after dudxyz to recover
+!!   the true physical gradient dp/dx.
 !!
 !! ## Pressure gradient modes
 !!
-!! **CPG** (`use_constant_dpdx: true`, default):
-!!   Uniform scalar `dpdx_constant` [Pa/m] at every wall node. Set to 0 for ZPG.
+!! CPG (`use_constant_dpdx: true`, default):
+!!   Uniform scalar `dpdx_constant` [Pa/m] at every wall node.
+!!   Set to 0.0 for ZPG warmup.
 !!
-!! **APG** (`use_constant_dpdx: false`):
-!!   Per-node temporally filtered local streamwise pressure gradient.
+!! APG (`use_constant_dpdx: false`):
+!!   Per-node temporally filtered wall-tangential pressure gradient
+!!   magnitude with sign, computed from dudxyz(p) corrected by jac.
 !!
-!! ## APG framework design
+!! ## APG double-buffer design
 !!
-!! Three structural problems caused all previous blow-ups, each addressed here:
+!!   grad_px/py/pz     = physical gradient dp/dx from p_{N-1}
+!!   grad_px_buf/...   = physical gradient dp/dx from p_N (buffer)
 !!
-!! ### Problem A — Gradient timing
+!!   Both arrays are zero for t < t_filter_start - t_filter (FIX 8).
 !!
-!!   `compute()` is called from the Momentum Krylov solver. At step N's
-!!   first call, the pnpn ordering (Pressure solve -> Velocity correct ->
-!!   Momentum solve) means `p` in the registry is the CONVERGED step-N
-!!   pressure. Using `dudxyz(p_N)` during step N gives the current-step's
-!!   gradient, which can be large during turbulent transition even after
-!!   the previous step was stable.
-!!
-!!   FIX: double-buffer the gradient.
-!!     grad_px/py/pz     = gradient from p_{N-1} (PREVIOUS step, safe to use)
-!!     grad_px_buf/...   = gradient from p_N (CURRENT step, stored for next step)
-!!
-!!   At step N's first call:
-!!     1. Use grad_px (= p_{N-1} gradient) to update the IIR filter.
-!!     2. Compute dudxyz(p_N) -> grad_px_buf.
-!!     3. Copy buf -> active: grad_px <- grad_px_buf.
-!!     4. Record grad_tstep = tstep.
-!!
-!!   This guarantees the filter always operates on a one-step-lagged,
-!!   previously-converged pressure gradient.
-!!
-!! ### Problem B — Filter warm-up during transition
-!!
-!!   For t < t_filter_start, the flow is in turbulent transition. The
-!!   pressure field has physically meaningless transient values. Accumulating
-!!   the IIR filter during this period seeds it with garbage, which compounds
-!!   over many steps even with the Stokes clamp active.
-!!
-!!   FIX: the `t_filter_start` parameter (JSON, default 5.0 outer time units).
-!!     t <  t_filter_start: dpdx_filt(:) = 0 (ZPG), filter NOT updated.
-!!     t >= t_filter_start: IIR filter accumulates normally.
-!!
-!!   The double-buffer IS updated every step regardless, so at t_filter_start
-!!   the filter immediately has access to a correct, recent p_{N-1} gradient.
-!!
-!!   Default t_filter_start = 5.0 ensures transition is complete before the
-!!   APG correction activates. The model runs as ZPG Duprat (Van Driest)
-!!   during transition — physically correct and numerically stable.
-!!
-!! ### Problem C — Inexact dt
-!!
-!!   Previous code estimated dt = t/(tstep-1), giving the MEAN dt, not the
-!!   current dt. For variable-timestep runs, this gives wrong beta_f.
-!!
-!!   FIX: store `t_prev` as a type member. Exact dt = t - t_prev.
-!!
-!! ### Clamp (secondary defence)
-!!
-!!   Stokes-based self-consistent clamp applied to dpdx_local before the
-!!   filter update:
-!!
-!!     max_dpdx = 2 * (magu * nu / h)^(3/2) / nu
-!!
-!!   Derived by setting u_P_max = u_tau_stokes = sqrt(magu*nu/h) and
-!!   inverting the Simpson scale. When clamped, alpha >= 0.5 is guaranteed,
-!!   keeping the ODE numerator positive and Newton convergent.
+!!   At step N's first Krylov call (t >= t_filter_start - t_filter):
+!!     1. Use grad_px (= p_{N-1}) for IIR filter update.
+!!     2. Compute dudxyz(p_N)*jac -> grad_px_buf.  [FIX 10]
+!!     3. Promote: grad_px <- grad_px_buf.
+!!     4. Set grad_tstep = tstep, t_prev = t.
 !!
 !! ## JSON parameters
 !!
@@ -123,10 +115,6 @@
 !!   dpdx_constant    : real    (default 0.0  [Pa/m])
 !!   t_filter_start   : real    (default 5.0  [outer time units])
 !!   t_filter         : real    (default 1.0  [outer time units])
-!!
-!! ## Reference
-!!   Duprat, C., Balarac, G., Metais, O., Congedo, P. M., and Brugiere, O.
-!!   (2011). Physics of Fluids, 23(1), 015101.
 !!
 module duprat
   use field, only: field_t
@@ -158,28 +146,28 @@ module duprat
      logical        :: use_constant_dpdx = .true.
      real(kind=rp) :: dpdx_const = 0.0_rp
      ! APG filter parameters
-     real(kind=rp) :: t_filter_start = 5.0_rp  ! start filter at this time
-     real(kind=rp) :: t_filter       = 1.0_rp  ! IIR time scale
+     real(kind=rp) :: t_filter_start = 5.0_rp
+     real(kind=rp) :: t_filter       = 1.0_rp
      ! Nu and rho at wall nodes
      type(vector_t) :: nu
-     type(vector_t) :: rho_w
-     ! Per-node IIR filtered streamwise pressure gradient [Pa/m]
-     ! Zero until t >= t_filter_start. Converges to local mean afterwards.
+     type(vector_t) :: rho_w   ! kept for completeness; not passed to kernel
+     ! Per-node IIR filtered wall-tangential |dP/ds| with sign [Pa/m].
+     ! Zero until t >= t_filter_start.
      real(kind=rp), allocatable :: dpdx_filt(:)
-     ! ACTIVE gradient arrays: hold grad(p_{N-1}) — the PREVIOUS step's gradient.
-     ! Safe to use for the filter update at step N.
+     ! ACTIVE gradient: physical dp/dx from p_{N-1}, used at step N's filter.
+     ! Zero for t < t_filter_start - t_filter  (FIX 8).
      real(kind=rp), allocatable :: grad_px(:,:,:,:)
      real(kind=rp), allocatable :: grad_py(:,:,:,:)
      real(kind=rp), allocatable :: grad_pz(:,:,:,:)
-     ! BUFFER gradient arrays: hold grad(p_N) — the CURRENT step's gradient.
-     ! Computed at step N's first call. Promoted to active at step N+1.
+     ! BUFFER gradient: physical dp/dx from p_N, promoted at step N+1.
+     ! Zero for t < t_filter_start - t_filter  (FIX 8).
      real(kind=rp), allocatable :: grad_px_buf(:,:,:,:)
      real(kind=rp), allocatable :: grad_py_buf(:,:,:,:)
      real(kind=rp), allocatable :: grad_pz_buf(:,:,:,:)
-     ! Krylov guard: fires update on FIRST call per timestep only
+     ! Krylov guard: fires once per timestep only.
      integer        :: grad_tstep = 0
-     ! Previous time for exact dt computation
-     real(kind=rp) :: t_prev = -1.0_rp   ! -1 signals "first call ever"
+     ! FIX 4: t_prev for exact dt. -1 = "first call ever".
+     real(kind=rp) :: t_prev = -1.0_rp
    contains
      procedure, pass(this) :: init              => duprat_init
      procedure, pass(this) :: partial_init      => duprat_partial_init
@@ -208,14 +196,18 @@ contains
     call json_get_or_lookup(json, "kappa", kappa)
     call json_get_or_lookup(json, "beta",  beta)
     call json_get_or_lookup(json, "A",     A)
-    call json_get_or_default(json, "use_constant_dpdx", use_constant_dpdx, .true.)
-    call json_get_or_default(json, "dpdx_constant",     dpdx_const,      0.0_rp)
-    call json_get_or_default(json, "t_filter_start",    t_filter_start,  5.0_rp)
-    call json_get_or_default(json, "t_filter",          t_filter,        1.0_rp)
+    call json_get_or_default(json, "use_constant_dpdx", use_constant_dpdx, &
+         .true.)
+    call json_get_or_default(json, "dpdx_constant",  dpdx_const,     0.0_rp)
+    call json_get_or_default(json, "t_filter_start", t_filter_start, 5.0_rp)
+    call json_get_or_default(json, "t_filter",       t_filter,       1.0_rp)
 
     call this%init_from_components(scheme_name, coef, msk, facet, h_index, &
-         kappa, beta, A, use_constant_dpdx, dpdx_const, t_filter_start, t_filter)
+         kappa, beta, A, use_constant_dpdx, dpdx_const, t_filter_start, &
+         t_filter)
   end subroutine duprat_init
+
+  ! ---------------------------------------------------------------------------
 
   subroutine duprat_partial_init(this, coef, json)
     class(duprat_t), intent(inout) :: this
@@ -226,11 +218,17 @@ contains
     call json_get_or_lookup(json, "kappa", this%kappa)
     call json_get_or_lookup(json, "beta",  this%beta)
     call json_get_or_lookup(json, "A",     this%A)
-    call json_get_or_default(json, "use_constant_dpdx", this%use_constant_dpdx, .true.)
-    call json_get_or_default(json, "dpdx_constant",     this%dpdx_const,      0.0_rp)
-    call json_get_or_default(json, "t_filter_start",    this%t_filter_start,  5.0_rp)
-    call json_get_or_default(json, "t_filter",          this%t_filter,        1.0_rp)
+    call json_get_or_default(json, "use_constant_dpdx", &
+         this%use_constant_dpdx, .true.)
+    call json_get_or_default(json, "dpdx_constant",  this%dpdx_const,     &
+         0.0_rp)
+    call json_get_or_default(json, "t_filter_start", this%t_filter_start, &
+         5.0_rp)
+    call json_get_or_default(json, "t_filter",       this%t_filter,       &
+         1.0_rp)
   end subroutine duprat_partial_init
+
+  ! ---------------------------------------------------------------------------
 
   subroutine duprat_finalize(this, msk, facet)
     class(duprat_t), intent(inout) :: this
@@ -253,18 +251,18 @@ contains
        allocate(this%grad_px_buf (lx, lx, lx, nelv))
        allocate(this%grad_py_buf (lx, lx, lx, nelv))
        allocate(this%grad_pz_buf (lx, lx, lx, nelv))
-       this%dpdx_filt    = 0.0_rp
-       this%grad_px      = 0.0_rp
-       this%grad_py      = 0.0_rp
-       this%grad_pz      = 0.0_rp
-       this%grad_px_buf  = 0.0_rp
-       this%grad_py_buf  = 0.0_rp
-       this%grad_pz_buf  = 0.0_rp
+       this%dpdx_filt   = 0.0_rp
+       this%grad_px     = 0.0_rp
+       this%grad_py     = 0.0_rp
+       this%grad_pz     = 0.0_rp
+       this%grad_px_buf = 0.0_rp
+       this%grad_py_buf = 0.0_rp
+       this%grad_pz_buf = 0.0_rp
     end if
   end subroutine duprat_finalize
 
-  ! NOTE: init_from_components must allocate APG arrays too because
-  ! init_base calls finalize_base only, NOT the child duprat_finalize.
+  ! ---------------------------------------------------------------------------
+
   subroutine duprat_init_from_components(this, scheme_name, coef, msk, &
        facet, h_index, kappa, beta, A, use_constant_dpdx, dpdx_const, &
        t_filter_start, t_filter)
@@ -303,15 +301,17 @@ contains
        allocate(this%grad_px_buf (lx, lx, lx, nelv))
        allocate(this%grad_py_buf (lx, lx, lx, nelv))
        allocate(this%grad_pz_buf (lx, lx, lx, nelv))
-       this%dpdx_filt    = 0.0_rp
-       this%grad_px      = 0.0_rp
-       this%grad_py      = 0.0_rp
-       this%grad_pz      = 0.0_rp
-       this%grad_px_buf  = 0.0_rp
-       this%grad_py_buf  = 0.0_rp
-       this%grad_pz_buf  = 0.0_rp
+       this%dpdx_filt   = 0.0_rp
+       this%grad_px     = 0.0_rp
+       this%grad_py     = 0.0_rp
+       this%grad_pz     = 0.0_rp
+       this%grad_px_buf = 0.0_rp
+       this%grad_py_buf = 0.0_rp
+       this%grad_pz_buf = 0.0_rp
     end if
   end subroutine duprat_init_from_components
+
+  ! ---------------------------------------------------------------------------
 
   subroutine duprat_free(this)
     class(duprat_t), intent(inout) :: this
@@ -340,8 +340,8 @@ contains
     call field_invcol3(temp, this%mu, this%rho)
 
     if (NEKO_BCKND_DEVICE .eq. 1) then
-       call device_masked_gather_copy_0(this%nu%x_d, temp%x_d, this%msk_d, &
-            temp%size(), this%nu%size())
+       call device_masked_gather_copy_0(this%nu%x_d, temp%x_d, &
+            this%msk_d, temp%size(), this%nu%size())
        call device_masked_gather_copy_0(this%rho_w%x_d, this%rho%x_d, &
             this%msk_d, this%rho%size(), this%rho_w%size())
     else
@@ -358,47 +358,19 @@ contains
   ! Main compute
   ! ===========================================================================
 
-  !> Compute wall shear stress using the Duprat (2011) model.
-  !!
-  !! **CPG path** (`use_constant_dpdx = .true.`):
-  !!   Passes `dpdx_const` directly to the kernel. No field access.
-  !!
-  !! **APG path** (`use_constant_dpdx = .false.`):
-  !!
-  !!   Gated by `grad_tstep` to fire EXACTLY ONCE per timestep.
-  !!   On the first call of step N:
-  !!
-  !!   Step 1 — compute exact dt:
-  !!     if t_prev < 0: dt = t  (first ever call)
-  !!     else:          dt = t - t_prev  (exact, not mean)
-  !!
-  !!   Step 2 — IIR filter update (only if t >= t_filter_start):
-  !!     For each wall node i, using the ACTIVE gradient (= grad(p_{N-1})):
-  !!       dpdx_local = grad_px[ind_r,ind_s,ind_t,ind_e] * (ui/magu)
-  !!                  + grad_py[...] * (vi/magu)
-  !!                  + grad_pz[...] * (wi/magu)
-  !!       Clamp: |dpdx_local| <= 2*(magu*nu/h)^1.5/nu   [Stokes bound]
-  !!       beta_f = min(dt/t_filter, 0.5)
-  !!       dpdx_filt[i] = (1-beta_f)*dpdx_filt[i] + beta_f*dpdx_local
-  !!
-  !!     If t < t_filter_start: dpdx_filt stays at 0 (ZPG, no update).
-  !!
-  !!   Step 3 — update double-buffer (ALWAYS, regardless of t_filter_start):
-  !!     Compute dudxyz(p_N) -> grad_px_buf/py_buf/pz_buf   [current step's grad]
-  !!     grad_px <- grad_px_buf                              [promote: now p_{N-1} for N+1]
-  !!     grad_py <- grad_py_buf
-  !!     grad_pz <- grad_pz_buf
-  !!     t_prev = t,  grad_tstep = tstep
-  !!
-  !!   Note: `compute_mag_field()` is NOT called here; wall_model_bc does it.
   subroutine duprat_compute(this, t, tstep)
     class(duprat_t), intent(inout) :: this
     real(kind=rp),   intent(in)    :: t
     integer,         intent(in)    :: tstep
+
     type(field_t), pointer :: u, v, w, p
     integer       :: i
-    real(kind=rp) :: ui, vi, wi, normu, magu, dpdx_local, beta_f, dt
-    real(kind=rp) :: max_dpdx_local
+    real(kind=rp) :: ui, vi, wi, normu, magu
+    real(kind=rp) :: dpx, dpy, dpz, dp_n
+    real(kind=rp) :: dp_tx, dp_ty, dp_tz
+    real(kind=rp) :: dpdx_local, max_dpdx, beta_f, dt
+    ! FIX 9: linear ramp factor for smooth APG activation.
+    real(kind=rp) :: ramp
 
     call this%compute_nu()
 
@@ -410,122 +382,193 @@ contains
        call neko_error("Duprat GPU kernel not yet implemented")
     end if
 
+    ! =========================================================================
+    ! CPG / ZPG path
+    ! =========================================================================
     if (this%use_constant_dpdx) then
 
-       ! ---- CPG / ZPG path --------------------------------------------------
        call duprat_compute_cpu( &
             u%x, v%x, w%x, &
             this%ind_r, this%ind_s, this%ind_t, this%ind_e, &
             this%n_x%x, this%n_y%x, this%n_z%x, &
-            this%nu%x, this%rho_w%x, this%h%x, &
+            this%nu%x, this%h%x, &
             this%tau_x%x, this%tau_y%x, this%tau_z%x, &
             this%n_nodes, u%Xh%lx, u%msh%nelv, &
-            this%kappa, this%beta, this%A, this%dpdx_const)
+            this%kappa, this%beta, this%A, this%dpdx_const, tstep)
 
+    ! =========================================================================
+    ! APG path
+    ! =========================================================================
     else
 
-       ! ---- APG path --------------------------------------------------------
-       !
-       ! Gate: fire ONCE per timestep (first Krylov call only).
-       ! On subsequent calls: reuse dpdx_filt unchanged.
+       ! Krylov guard: first call per timestep only.
        if (tstep .ne. this%grad_tstep) then
 
-          ! --- Step 1: exact dt ---
+          ! -------------------------------------------------------------------
+          ! FIX 4: restart-safe exact dt.
+          ! t_prev = -1 on very first call -> dt = 0 -> skip filter update.
+          ! dpdx_filt stays 0 (ZPG), buffer populated for next step.
+          ! -------------------------------------------------------------------
           if (this%t_prev < 0.0_rp) then
-             dt = t             ! very first call ever; t ≈ first dt
+             dt = 0.0_rp
           else
              dt = t - this%t_prev
           end if
-          dt = max(dt, 1.0e-14_rp)   ! guard against zero or negative dt
+          dt = max(dt, 0.0_rp)
 
-          ! --- Step 2: IIR filter update ---
-          ! Uses the ACTIVE gradient arrays = grad(p_{N-1}).
-          ! At the very first call (tstep=1), the active arrays are zero
-          ! (initialised in finalize/init_from_components), so dpdx_local=0
-          ! and dpdx_filt stays 0. This is correct: ZPG on the first step.
-          if (t >= this%t_filter_start) then
+          ! -------------------------------------------------------------------
+          ! IIR filter update.
+          ! Fires only when t >= t_filter_start AND dt > 0.
+          ! Uses ACTIVE gradient = physical dp/dx from p_{N-1}.
+          ! -------------------------------------------------------------------
+          if (t >= this%t_filter_start .and. dt > 1.0e-14_rp) then
 
-             beta_f = min(dt / max(this%t_filter, 1.0e-14_rp), 0.5_rp)
+             ! FIX 9: linear ramp of beta_f over first t_filter window.
+             ! ramp = 0 at t = t_filter_start  (no update yet)
+             ! ramp = 1 at t = t_filter_start + t_filter  (full weight)
+             ramp   = min((t - this%t_filter_start) &
+                          / max(this%t_filter, 1.0e-14_rp), 1.0_rp)
+             ramp   = max(ramp, 0.0_rp)
+             beta_f = min(dt / max(this%t_filter, 1.0e-14_rp), 0.5_rp) &
+                    * ramp
 
              do i = 1, this%n_nodes
-                ! Sample velocity at off-wall point; project out normal component.
-                ui = u%x(this%ind_r(i), this%ind_s(i), this%ind_t(i), this%ind_e(i))
-                vi = v%x(this%ind_r(i), this%ind_s(i), this%ind_t(i), this%ind_e(i))
-                wi = w%x(this%ind_r(i), this%ind_s(i), this%ind_t(i), this%ind_e(i))
-                normu = ui*this%n_x%x(i) + vi*this%n_y%x(i) + wi*this%n_z%x(i)
-                ui = ui - normu*this%n_x%x(i)
-                vi = vi - normu*this%n_y%x(i)
-                wi = wi - normu*this%n_z%x(i)
-                magu = sqrt(ui**2 + vi**2 + wi**2)
 
-                if (magu <= 1.0e-14_rp) cycle  ! leave dpdx_filt unchanged
+                ! Sample velocity at sampling point; remove wall-normal part.
+                ui    = u%x(this%ind_r(i), this%ind_s(i), &
+                            this%ind_t(i), this%ind_e(i))
+                vi    = v%x(this%ind_r(i), this%ind_s(i), &
+                            this%ind_t(i), this%ind_e(i))
+                wi    = w%x(this%ind_r(i), this%ind_s(i), &
+                            this%ind_t(i), this%ind_e(i))
+                normu = ui*this%n_x%x(i) + vi*this%n_y%x(i) + &
+                        wi*this%n_z%x(i)
+                ui    = ui - normu*this%n_x%x(i)
+                vi    = vi - normu*this%n_y%x(i)
+                wi    = wi - normu*this%n_z%x(i)
+                magu  = sqrt(ui**2 + vi**2 + wi**2)
 
-                ! Project PREVIOUS step's gradient onto tangential direction.
-                dpdx_local = &
-                     this%grad_px( &
-                          this%ind_r(i),this%ind_s(i),this%ind_t(i),this%ind_e(i)) &
-                     * (ui/magu) &
-                     + this%grad_py( &
-                          this%ind_r(i),this%ind_s(i),this%ind_t(i),this%ind_e(i)) &
-                     * (vi/magu) &
-                     + this%grad_pz( &
-                          this%ind_r(i),this%ind_s(i),this%ind_t(i),this%ind_e(i)) &
-                     * (wi/magu)
+                if (magu <= 1.0e-14_rp) cycle
 
-                ! Stokes self-consistent clamp (last-resort guard):
+                ! Sample PREVIOUS-step physical gradient at sampling point.
+                ! grad_px contains dp/dx (after FIX 10 Jacobian correction).
+                dpx = this%grad_px( &
+                     this%ind_r(i), this%ind_s(i), &
+                     this%ind_t(i), this%ind_e(i))
+                dpy = this%grad_py( &
+                     this%ind_r(i), this%ind_s(i), &
+                     this%ind_t(i), this%ind_e(i))
+                dpz = this%grad_pz( &
+                     this%ind_r(i), this%ind_s(i), &
+                     this%ind_t(i), this%ind_e(i))
+
+                ! FIX 2: wall-tangential gradient magnitude + physical sign.
+                !
+                ! Step 2a: remove wall-normal component from grad_p.
+                dp_n  = dpx*this%n_x%x(i) + dpy*this%n_y%x(i) + &
+                        dpz*this%n_z%x(i)
+                dp_tx = dpx - dp_n*this%n_x%x(i)
+                dp_ty = dpy - dp_n*this%n_y%x(i)
+                dp_tz = dpz - dp_n*this%n_z%x(i)
+
+                ! Step 2b: magnitude of wall-tangential gradient vector.
+                dpdx_local = sqrt(dp_tx**2 + dp_ty**2 + dp_tz**2)
+
+                ! Step 2c: sign from dot of tangential gradient with
+                ! wall-parallel velocity direction.
+                ! Positive = APG (decelerating), negative = FPG.
+                ! Physically correct even in recirculation zones.
+                dpdx_local = dpdx_local * &
+                     sign(1.0_rp, dp_tx*(ui/magu) + dp_ty*(vi/magu) + &
+                                  dp_tz*(wi/magu))
+
+                ! FIX 3: Stokes clamp applied ONCE here (not in kernel).
                 ! Ensures u_P <= u_tau_stokes -> alpha >= 0.5 when clamped.
-                max_dpdx_local = 2.0_rp &
-                     * (magu * this%nu%x(i) / this%h%x(i))**1.5_rp &
+                max_dpdx = 2.0_rp * &
+                     (magu * this%nu%x(i) / this%h%x(i))**1.5_rp &
                      / this%nu%x(i)
-                dpdx_local = sign(min(abs(dpdx_local), max_dpdx_local), dpdx_local)
+                dpdx_local = sign( &
+                     min(abs(dpdx_local), max_dpdx), dpdx_local)
 
                 ! IIR exponential moving average.
-                this%dpdx_filt(i) = (1.0_rp - beta_f) * this%dpdx_filt(i) &
+                this%dpdx_filt(i) = (1.0_rp - beta_f)*this%dpdx_filt(i) &
                                   + beta_f * dpdx_local
+
              end do
 
-          else
-             ! t < t_filter_start: zero the filter (ZPG, no update).
+          else if (t < this%t_filter_start) then
+             ! Before filter start: keep ZPG (zero), no update.
              this%dpdx_filt(:) = 0.0_rp
           end if
+          ! If t >= t_filter_start but dt = 0 (first call after restart):
+          ! skip update, reuse last valid dpdx_filt unchanged.
 
-          ! --- Step 3: update double-buffer (ALWAYS) ---
+          ! -------------------------------------------------------------------
+          ! FIX 8 + FIX 10: Double-buffer update with Jacobian correction.
           !
-          ! Compute grad(p_N) -> buffer. Then promote buffer -> active.
-          ! After this, grad_px/py/pz = grad(p_N) which becomes
-          ! grad(p_{N-1}) for the next timestep's filter update.
+          ! FIX 8: only run dudxyz within one t_filter window before
+          ! t_filter_start and thereafter. Before that window, keep zero.
           !
-          ! This uses the CURRENT step's converged pressure (p_N), stored
-          ! as the lagged gradient for step N+1.
-          p => neko_registry%get_field("p")
+          ! FIX 10: dudxyz returns (1/J)*dp/dx due to internal jacinv
+          ! multiplication in cpu_dudxyz. Multiply by coef%jac to recover
+          ! the true physical gradient dp/dx. Without this correction, on
+          ! curved walls (periodic hill) the gradient is wrong by J ~ 2-5x,
+          ! causing wrong u_P and CFL blow-up when APG activates.
+          ! -------------------------------------------------------------------
+          if (t >= this%t_filter_start - this%t_filter) then
 
-          call dudxyz(this%grad_px_buf, p%x, &
-               this%coef%drdx, this%coef%dsdx, this%coef%dtdx, this%coef)
-          call dudxyz(this%grad_py_buf, p%x, &
-               this%coef%drdy, this%coef%dsdy, this%coef%dtdy, this%coef)
-          call dudxyz(this%grad_pz_buf, p%x, &
-               this%coef%drdz, this%coef%dsdz, this%coef%dtdz, this%coef)
+             p => neko_registry%get_field("p")
 
-          ! Promote buffer -> active (simple array copy; avoids pointer aliasing).
-          this%grad_px = this%grad_px_buf
-          this%grad_py = this%grad_py_buf
-          this%grad_pz = this%grad_pz_buf
+             ! Compute weak gradient (1/J)*dp/dx over entire domain
+             call dudxyz(this%grad_px_buf, p%x, &
+                  this%coef%drdx, this%coef%dsdx, this%coef%dtdx, this%coef)
+             call dudxyz(this%grad_py_buf, p%x, &
+                  this%coef%drdy, this%coef%dsdy, this%coef%dtdy, this%coef)
+             call dudxyz(this%grad_pz_buf, p%x, &
+                  this%coef%drdz, this%coef%dsdz, this%coef%dtdz, this%coef)
 
+             ! FIX 10: multiply by J to get true physical gradient dp/dx.
+             ! coef%jac has shape (lx, ly, lz, nelv) — same as grad buffers.
+             this%grad_px_buf = this%grad_px_buf * this%coef%jac
+             this%grad_py_buf = this%grad_py_buf * this%coef%jac
+             this%grad_pz_buf = this%grad_pz_buf * this%coef%jac
+
+             ! Promote buffer -> active.
+             this%grad_px = this%grad_px_buf
+             this%grad_py = this%grad_py_buf
+             this%grad_pz = this%grad_pz_buf
+
+          else
+             ! Before pre-activation window: zero all gradient arrays.
+             ! First filter update sees grad_p = 0 and dpdx_filt ramps
+             ! up cleanly from zero via FIX 9.
+             this%grad_px     = 0.0_rp
+             this%grad_py     = 0.0_rp
+             this%grad_pz     = 0.0_rp
+             this%grad_px_buf = 0.0_rp
+             this%grad_py_buf = 0.0_rp
+             this%grad_pz_buf = 0.0_rp
+          end if
+
+          ! FIX 4: record current time for next step's exact dt.
           this%t_prev     = t
           this%grad_tstep = tstep
 
        end if  ! end of first-call-only block
 
-       ! Call APG kernel with per-node filtered gradient.
+       ! -----------------------------------------------------------------------
+       ! APG kernel: per-node pre-clamped filtered gradient.
+       ! dpdx_filt is zero before t_filter_start and ramps up smoothly after.
+       ! -----------------------------------------------------------------------
        call duprat_compute_apg_cpu( &
             u%x, v%x, w%x, &
             this%ind_r, this%ind_s, this%ind_t, this%ind_e, &
             this%n_x%x, this%n_y%x, this%n_z%x, &
-            this%nu%x, this%rho_w%x, this%h%x, &
+            this%nu%x, this%h%x, &
             this%tau_x%x, this%tau_y%x, this%tau_z%x, &
             this%n_nodes, u%Xh%lx, u%msh%nelv, &
             this%kappa, this%beta, this%A, &
-            this%dpdx_filt)
+            this%dpdx_filt, tstep)
 
     end if
 
