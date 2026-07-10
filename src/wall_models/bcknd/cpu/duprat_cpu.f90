@@ -36,7 +36,7 @@
 !!   duprat_compute_cpu     -- CPG mode (uniform scalar dP/dx).
 !!   duprat_compute_apg_cpu -- APG mode (per-node IIR-filtered dP/dx array).
 !!
-!! ## Changes from original
+!! ## Changes from original -
 !!
 !! FIX 1 -- rho_w removed from u_P formula.
 !!   Neko's pressure field p is the kinematic pressure (p/rho).
