@@ -36,53 +36,6 @@
 !! Reference: Duprat, C., Balarac, G., Metais, O., Congedo, P. M., and
 !!   Brugiere, O. (2011). Physics of Fluids, 23(1), 015101.
 !!
-!! ## Fixes applied (cumulative)
-!!
-!! FIX 1 -- rho_w removed from kernel calls.
-!!   Neko's pressure field is kinematic (p/rho). Duprat u_P is also
-!!   kinematic. Passing rho_w into the kernel caused a second division
-!!   by rho, making u_P too small by rho^(1/3) and breaking the model
-!!   for any rho /= 1. rho_w is still gathered (for future use) but
-!!   no longer passed to solve_duprat.
-!!
-!! FIX 2 -- Wall-tangential gradient magnitude replaces velocity projection.
-!!   Old: dpdx_local = grad_p . (u_tang/|u_tang|)
-!!   Problem: this quantity flips sign in recirculation zones (u reverses),
-!!   giving wrong APG/FPG diagnosis inside the separation bubble.
-!!   New: dpdx_local = |grad_p - (grad_p . n)*n|  [tangential magnitude]
-!!   Sign recovered from dot of tangential gradient with flow direction.
-!!
-!! FIX 3 -- Stokes clamp removed from APG kernel.
-!!   Applied ONCE in the filter update loop only. Double-clamping with
-!!   different magu values (filter vs. kernel) falsely zeros valid gradients.
-!!
-!! FIX 4 -- Restart-safe dt computation.
-!!   dt = 0 on the very first call (skip filter update), then
-!!   dt = t - t_prev for all subsequent steps.
-!!
-!! FIX 5,6,7 -- In duprat_cpu.f90 (GL-5 quadrature, relaxed tolerance,
-!!   warm Newton guess).
-!!
-!! FIX 8 -- Buffer guard: dudxyz only called within one t_filter window
-!!   before t_filter_start. Prevents stale fully-turbulent gradient from
-!!   causing step change in tau_w at filter activation.
-!!
-!! FIX 9 -- beta_f linear ramp over first t_filter window after activation.
-!!   Scales beta_f from 0 to full value linearly, preventing step change
-!!   in tau_w when APG activates.
-!!
-!! FIX 10 -- Jacobian correction after dudxyz.
-!!   dudxyz(du, u, drdx, dsdx, dtdx, coef) computes:
-!!     du = (1/J) * (drdx*D_r(u) + dsdx*D_s(u) + dtdx*D_t(u))
-!!   because cpu_dudxyz multiplies by coef%jacinv = 1/J internally.
-!!   This gives (1/J)*dp/dx, NOT dp/dx.
-!!   On curved geometries (periodic hill), J varies by factors of 2-5
-!!   near the wall surface. Without correction, dpdx_local is wrong by
-!!   the same factor, giving wrong u_P and causing blow-up when APG
-!!   activates (observed: CFL explosion at t=110.5 on Fritz).
-!!   Fix: multiply each grad buffer by coef%jac after dudxyz to recover
-!!   the true physical gradient dp/dx.
-!!
 !! ## Pressure gradient modes
 !!
 !! CPG (`use_constant_dpdx: true`, default):
@@ -98,11 +51,11 @@
 !!   grad_px/py/pz     = physical gradient dp/dx from p_{N-1}
 !!   grad_px_buf/...   = physical gradient dp/dx from p_N (buffer)
 !!
-!!   Both arrays are zero for t < t_filter_start - t_filter (FIX 8).
+!!   Both arrays are zero for t < t_filter_start - t_filter.
 !!
 !!   At step N's first Krylov call (t >= t_filter_start - t_filter):
 !!     1. Use grad_px (= p_{N-1}) for IIR filter update.
-!!     2. Compute dudxyz(p_N)*jac -> grad_px_buf.  [FIX 10]
+!!     2. Compute dudxyz(p_N)*jac -> grad_px_buf.
 !!     3. Promote: grad_px <- grad_px_buf.
 !!     4. Set grad_tstep = tstep, t_prev = t.
 !!
@@ -155,18 +108,18 @@ module duprat
      ! Zero until t >= t_filter_start.
      real(kind=rp), allocatable :: dpdx_filt(:)
      ! ACTIVE gradient: physical dp/dx from p_{N-1}, used at step N's filter.
-     ! Zero for t < t_filter_start - t_filter  (FIX 8).
+     ! Zero for t < t_filter_start - t_filter
      real(kind=rp), allocatable :: grad_px(:,:,:,:)
      real(kind=rp), allocatable :: grad_py(:,:,:,:)
      real(kind=rp), allocatable :: grad_pz(:,:,:,:)
      ! BUFFER gradient: physical dp/dx from p_N, promoted at step N+1.
-     ! Zero for t < t_filter_start - t_filter  (FIX 8).
+     ! Zero for t < t_filter_start - t_filter
      real(kind=rp), allocatable :: grad_px_buf(:,:,:,:)
      real(kind=rp), allocatable :: grad_py_buf(:,:,:,:)
      real(kind=rp), allocatable :: grad_pz_buf(:,:,:,:)
      ! Krylov guard: fires once per timestep only.
      integer        :: grad_tstep = 0
-     ! FIX 4: t_prev for exact dt. -1 = "first call ever".
+     ! t_prev for exact dt. -1 = "first call ever".
      real(kind=rp) :: t_prev = -1.0_rp
    contains
      procedure, pass(this) :: init              => duprat_init
@@ -369,7 +322,7 @@ contains
     real(kind=rp) :: dpx, dpy, dpz, dp_n
     real(kind=rp) :: dp_tx, dp_ty, dp_tz
     real(kind=rp) :: dpdx_local, max_dpdx, beta_f, dt
-    ! FIX 9: linear ramp factor for smooth APG activation.
+    ! linear ramp factor for smooth APG activation.
     real(kind=rp) :: ramp
 
     call this%compute_nu()
@@ -405,7 +358,7 @@ contains
        if (tstep .ne. this%grad_tstep) then
 
           ! -------------------------------------------------------------------
-          ! FIX 4: restart-safe exact dt.
+          ! restart-safe exact dt.
           ! t_prev = -1 on very first call -> dt = 0 -> skip filter update.
           ! dpdx_filt stays 0 (ZPG), buffer populated for next step.
           ! -------------------------------------------------------------------
@@ -423,7 +376,7 @@ contains
           ! -------------------------------------------------------------------
           if (t >= this%t_filter_start .and. dt > 1.0e-14_rp) then
 
-             ! FIX 9: linear ramp of beta_f over first t_filter window.
+             ! linear ramp of beta_f over first t_filter window.
              ! ramp = 0 at t = t_filter_start  (no update yet)
              ! ramp = 1 at t = t_filter_start + t_filter  (full weight)
              ramp   = min((t - this%t_filter_start) &
@@ -451,7 +404,7 @@ contains
                 if (magu <= 1.0e-14_rp) cycle
 
                 ! Sample PREVIOUS-step physical gradient at sampling point.
-                ! grad_px contains dp/dx (after FIX 10 Jacobian correction).
+                ! grad_px contains dp/dx (after Jacobian correction).
                 dpx = this%grad_px( &
                      this%ind_r(i), this%ind_s(i), &
                      this%ind_t(i), this%ind_e(i))
@@ -462,7 +415,7 @@ contains
                      this%ind_r(i), this%ind_s(i), &
                      this%ind_t(i), this%ind_e(i))
 
-                ! FIX 2: wall-tangential gradient magnitude + physical sign.
+                ! wall-tangential gradient magnitude + physical sign.
                 !
                 ! Step 2a: remove wall-normal component from grad_p.
                 dp_n  = dpx*this%n_x%x(i) + dpy*this%n_y%x(i) + &
@@ -482,7 +435,7 @@ contains
                      sign(1.0_rp, dp_tx*(ui/magu) + dp_ty*(vi/magu) + &
                                   dp_tz*(wi/magu))
 
-                ! FIX 3: Stokes clamp applied ONCE here (not in kernel).
+                ! Stokes clamp applied ONCE here (not in kernel).
                 ! Ensures u_P <= u_tau_stokes -> alpha >= 0.5 when clamped.
                 max_dpdx = 2.0_rp * &
                      (magu * this%nu%x(i) / this%h%x(i))**1.5_rp &
@@ -504,12 +457,12 @@ contains
           ! skip update, reuse last valid dpdx_filt unchanged.
 
           ! -------------------------------------------------------------------
-          ! FIX 8 + FIX 10: Double-buffer update with Jacobian correction.
+          ! Double-buffer update with Jacobian correction.
           !
-          ! FIX 8: only run dudxyz within one t_filter window before
+          ! only run dudxyz within one t_filter window before
           ! t_filter_start and thereafter. Before that window, keep zero.
           !
-          ! FIX 10: dudxyz returns (1/J)*dp/dx due to internal jacinv
+          ! dudxyz returns (1/J)*dp/dx due to internal jacinv
           ! multiplication in cpu_dudxyz. Multiply by coef%jac to recover
           ! the true physical gradient dp/dx. Without this correction, on
           ! curved walls (periodic hill) the gradient is wrong by J ~ 2-5x,
@@ -527,7 +480,7 @@ contains
              call dudxyz(this%grad_pz_buf, p%x, &
                   this%coef%drdz, this%coef%dsdz, this%coef%dtdz, this%coef)
 
-             ! FIX 10: multiply by J to get true physical gradient dp/dx.
+             ! multiply by J to get true physical gradient dp/dx.
              ! coef%jac has shape (lx, ly, lz, nelv) — same as grad buffers.
              this%grad_px_buf = this%grad_px_buf * this%coef%jac
              this%grad_py_buf = this%grad_py_buf * this%coef%jac
@@ -541,7 +494,7 @@ contains
           else
              ! Before pre-activation window: zero all gradient arrays.
              ! First filter update sees grad_p = 0 and dpdx_filt ramps
-             ! up cleanly from zero via FIX 9.
+             ! up cleanly from zero.
              this%grad_px     = 0.0_rp
              this%grad_py     = 0.0_rp
              this%grad_pz     = 0.0_rp
@@ -550,7 +503,7 @@ contains
              this%grad_pz_buf = 0.0_rp
           end if
 
-          ! FIX 4: record current time for next step's exact dt.
+          ! record current time for next step's exact dt.
           this%t_prev     = t
           this%grad_tstep = tstep
 

@@ -42,10 +42,6 @@
 !!   Geschwindigkeitsverteilung in Rohren." Zeitschrift fur angewandte
 !!   Mathematik und Mechanik, 31(7-8), 208-219.
 !!
-!! Note: Some secondary sources (e.g. Brill 2022 eq. 2.42) add a spurious
-!! linear term y+/(1 + y+/11) that is NOT part of the original Reichardt
-!! formula and causes significant over-prediction of u+ in the log region.
-!!
 module reichardt_cpu
   use num_types, only : rp
   use logger, only : neko_log, NEKO_LOG_DEBUG, LOG_SIZE

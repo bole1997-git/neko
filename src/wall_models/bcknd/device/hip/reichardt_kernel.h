@@ -41,10 +41,6 @@
  *
  *   u⁺ = (1/κ)*ln(1 + κ*y⁺) + 7.8*[1 - exp(-y⁺/11) - (y⁺/11)*exp(-y⁺/3)]
  *
- * Note: Some secondary sources add a spurious linear term y⁺/(1 + y⁺/11)
- * that is NOT part of the original Reichardt (1951) formula and causes
- * significant over-prediction of u⁺ in the log region. It has been removed.
- *
  * Reference:
  *   Reichardt, H. (1951). "Vollständige Darstellung der turbulenten
  *   Geschwindigkeitsverteilung in Rohren." Zeitschrift für angewandte

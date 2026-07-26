@@ -186,10 +186,6 @@ contains
   !!
   !! Calls reichardt_compute_cpu on CPU backends.
   !! GPU support is not yet implemented.
-  !!
-  !! Note: compute_mag_field() is intentionally NOT called here.
-  !! The wall_model_bc driver calls it after every compute() for all
-  !! wall models. Calling it here would cause a spurious double invocation.
   subroutine reichardt_compute(this, t, tstep)
     class(reichardt_t), intent(inout) :: this
     real(kind=rp), intent(in) :: t

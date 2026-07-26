@@ -36,44 +36,6 @@
 !!   duprat_compute_cpu     -- CPG mode (uniform scalar dP/dx).
 !!   duprat_compute_apg_cpu -- APG mode (per-node IIR-filtered dP/dx array).
 !!
-!! ## Changes from original -
-!!
-!! FIX 1 -- rho_w removed from u_P formula.
-!!   Neko's pressure field p is the kinematic pressure (p/rho).
-!!   The Duprat (2011) formula is kinematic: u_P=(nu*|dP/dx|/2)^(1/3).
-!!   Dividing by rho_w a second time was dimensionally wrong and
-!!   caused blow-up in any run where rho /= 1.
-!!   rho_w has been removed from residual() and solve_duprat() entirely.
-!!   The CPG and APG kernels no longer receive or pass rho_w.
-!!
-!! FIX 2 -- Wall-tangential gradient magnitude replaces velocity projection.
-!!   The original dpdx_local = grad . (u/|u|) flips sign inside
-!!   recirculation zones (u reverses), giving spurious APG->FPG switches.
-!!   The correct quantity for Duprat u_P is the magnitude of the
-!!   wall-tangential pressure gradient (sign applied separately).
-!!   This is computed in duprat.f90 before the filter update.
-!!   The kernel receives a pre-projected scalar; no change needed here.
-!!
-!! FIX 3 -- Stokes clamp removed from APG kernel.
-!!   The clamp is applied once in the filter update (duprat.f90).
-!!   A second clamp in the kernel uses the current-step magu, which
-!!   can be near-zero at nodes that were active at the filter step,
-!!   falsely clamping dpdx_filt to zero.
-!!
-!! FIX 4 -- t_prev / restart fix is in duprat.f90, not here.
-!!
-!! FIX 5 -- N_QUAD=100 midpoint rule replaced by 5-point Gauss-Legendre.
-!!   Cost reduction: 100 evaluations/Newton-iter -> 5.
-!!   Accuracy: GL-5 integrates polynomials of degree <= 9 exactly;
-!!   more than sufficient for the smooth nu_t* integrand.
-!!
-!! FIX 6 -- Newton tolerance relaxed from 1e-8 to 1e-3.
-!!   Matches Spalding. LES velocities carry O(1%) noise; sub-percent
-!!   accuracy in utau does not improve physics.
-!!
-!! FIX 7 -- Warm initial guess from previous tau instead of Stokes.
-!!   Reduces average Newton iterations from ~20 to ~3-5 after step 1.
-!!
 !! ## Physics (Duprat et al. 2011, Phys. Fluids 23, 015101)
 !!
 !! Extended inner scaling:
@@ -103,7 +65,7 @@ module duprat_cpu
   public :: duprat_compute_cpu, duprat_compute_apg_cpu
 
   ! -------------------------------------------------------------------------
-  ! FIX 5: 5-point Gauss-Legendre quadrature on [0,1].
+  ! 5-point Gauss-Legendre quadrature on [0,1].
   ! Replaces the 100-point midpoint rule (20x fewer nu_t* evaluations).
   ! Nodes and weights from Abramowitz & Stegun Table 25.4.
   ! -------------------------------------------------------------------------
@@ -126,8 +88,8 @@ contains
   ! ===========================================================================
   ! Public: CPG / ZPG entry point (uniform scalar dpdx_const)
   ! ===========================================================================
-  ! FIX 1: rho_w removed from argument list entirely.
-  ! FIX 7: warm guess from previous tau (tstep argument added).
+  ! rho_w removed from argument list entirely.
+  ! warm guess from previous tau (tstep argument added).
   subroutine duprat_compute_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
        n_x, n_y, n_z, nu, h, tau_x, tau_y, tau_z, &
        n_nodes, lx, nelv, kappa, beta, A, dpdx_const, tstep)
@@ -159,7 +121,7 @@ contains
           cycle
        end if
 
-       ! FIX 7: warm guess from previous tau magnitude; Stokes only at step 1.
+       ! warm guess from previous tau magnitude; Stokes only at step 1.
        if (tstep .eq. 1) then
           guess = sqrt(magu * nu(i) / h(i))
        else
@@ -167,7 +129,7 @@ contains
           guess = max(guess, 1.0e-10_rp)
        end if
 
-       ! FIX 1: no rho_w argument
+       ! no rho_w argument
        utau = solve_duprat(magu, h(i), guess, nu(i), dpdx_const, &
                            kappa, beta, A)
 
@@ -181,9 +143,9 @@ contains
   ! ===========================================================================
   ! Public: APG entry point (per-node IIR-filtered dpdx array)
   ! ===========================================================================
-  ! FIX 1: rho_w removed.
-  ! FIX 3: Stokes clamp removed (applied once in duprat.f90 filter update).
-  ! FIX 7: warm guess from previous tau.
+  ! rho_w removed.
+  ! Stokes clamp removed (applied once in duprat.f90 filter update).
+  ! warm guess from previous tau. 
   !
   ! @param dpdx_filt  Per-node wall-tangential |dP/ds| [Pa/m], n_nodes.
   !   Already clamped by the Stokes bound in duprat.f90.
@@ -220,7 +182,7 @@ contains
           cycle
        end if
 
-       ! FIX 7: warm guess from previous tau; Stokes only at step 1.
+       ! warm guess from previous tau; Stokes only at step 1.
        if (tstep .eq. 1) then
           guess = sqrt(magu * nu(i) / h(i))
        else
@@ -228,8 +190,8 @@ contains
           guess = max(guess, 1.0e-10_rp)
        end if
 
-       ! FIX 3: dpdx_filt(i) is already clamped in duprat.f90 -- use directly.
-       ! FIX 1: no rho_w argument.
+       ! dpdx_filt(i) is already clamped in duprat.f90 -- use directly.
+       ! no rho_w argument.
        utau = solve_duprat(magu, h(i), guess, nu(i), dpdx_filt(i), &
                            kappa, beta, A)
 
@@ -259,7 +221,7 @@ contains
   end function nu_t_star
 
   ! ===========================================================================
-  ! Private: ODE integration -- FIX 5
+  ! Private: ODE integration
   ! 5-point Gauss-Legendre replaces 100-point midpoint (20x speedup).
   ! GL-5 integrates polynomials of degree <=9 exactly; sufficient here.
   ! ===========================================================================
@@ -286,7 +248,7 @@ contains
 
   ! ===========================================================================
   ! Private: Newton residual
-  ! FIX 1: rho_w removed -- u_P uses kinematic formula (nu*|dpdx|/2)^(1/3)
+  ! rho_w removed -- u_P uses kinematic formula (nu*|dpdx|/2)^(1/3)
   ! ===========================================================================
 
   function residual(utau, U_tang, y, nu, dpdx, kappa, beta, A) result(f)
@@ -294,7 +256,7 @@ contains
     real(kind=rp), intent(in) :: kappa, beta, A
     real(kind=rp) :: f, u_P, u_p_star, alpha, y_star, U_star, sign_dpdx
 
-    ! FIX 1: kinematic pressure velocity scale -- no rho_w division.
+    ! kinematic pressure velocity scale -- no rho_w division.
     ! Neko p is kinematic; Duprat eq. 6: u_P = (nu*|dP/dx|/2)^(1/3).
     if (abs(dpdx) < 1.0e-14_rp) then
        u_P = 0.0_rp
@@ -321,8 +283,8 @@ contains
 
   ! ===========================================================================
   ! Private: Newton-Raphson solver
-  ! FIX 1: rho_w removed from signature.
-  ! FIX 6: tolerance relaxed from 1e-8 to 1e-3 (matches Spalding).
+  ! rho_w removed from signature.
+  ! tolerance relaxed from 1e-8 to 1e-3 (matches Spalding).
   ! ===========================================================================
 
   function solve_duprat(U_tang, y, guess, nu, dpdx, kappa, beta, A) &
@@ -355,7 +317,7 @@ contains
 
        error = abs((utau - utau_old) / (abs(utau) + 1.0e-16_rp))
 
-       ! FIX 6: relaxed tolerance 1e-3 (was 1e-8).
+       ! relaxed tolerance 1e-3 (was 1e-8).
        ! LES velocities carry O(1%) fluctuation noise; tighter tolerance
        ! gives no physical benefit and triples iteration count.
        if (error < 1.0e-3_rp) then
