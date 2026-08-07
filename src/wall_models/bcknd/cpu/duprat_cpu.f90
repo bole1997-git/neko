@@ -31,31 +31,6 @@
 ! POSSIBILITY OF SUCH DAMAGE.
 !
 !> CPU kernels for `duprat_t`.
-!!
-!! Two public entry points:
-!!   duprat_compute_cpu     -- CPG mode (uniform scalar dP/dx).
-!!   duprat_compute_apg_cpu -- APG mode (per-node IIR-filtered dP/dx array).
-!!
-!! ## Physics (Duprat et al. 2011, Phys. Fluids 23, 015101)
-!!
-!! Extended inner scaling:
-!!   u_P    = (nu * |dP/dx| / 2)^(1/3)       [Simpson velocity scale]
-!!   u_p*   = sqrt(u_tau^2 + u_P^2)           [combined scale]
-!!   alpha  = u_tau^2 / u_p*^2  in [0,1]      [PG intensity]
-!!   y*     = y * u_p*/nu                      [extended wall unit]
-!!   U*     = U / u_p*
-!!
-!! Eddy viscosity (Van Driest damping, Eq. 6):
-!!   l_m*(y*) = (kappa + beta*(1-alpha)^1.5) * y*
-!!   nu_t*    = l_m* * (1 - exp(-y*/(1+A*alpha^3)))^2
-!!
-!! Velocity ODE (Eq. 5):
-!!   dU*/dy* = [sign(dP/dx)*(1-alpha)^1.5*y* + 1] / (1 + nu_t*)
-!!
-!! Newton: F(u_tau) = u_p*(u_tau)*U*(y*(u_tau)) - U_tang = 0
-!!   Jacobian: forward FD, delta = max(1e-6*utau, 1e-10)
-!!   Convergence: |delta_utau / utau| < 1e-3, max 100 iters
-!!
 module duprat_cpu
   use num_types, only: rp
   use logger, only: neko_log, NEKO_LOG_DEBUG, LOG_SIZE
@@ -64,11 +39,6 @@ module duprat_cpu
 
   public :: duprat_compute_cpu, duprat_compute_apg_cpu
 
-  ! -------------------------------------------------------------------------
-  ! 5-point Gauss-Legendre quadrature on [0,1].
-  ! Replaces the 100-point midpoint rule (20x fewer nu_t* evaluations).
-  ! Nodes and weights from Abramowitz & Stegun Table 25.4.
-  ! -------------------------------------------------------------------------
   integer,  parameter :: N_GL = 5
   real(rp), parameter :: GL_XI(N_GL) = [ &
        0.046910077936172_rp, &
@@ -83,26 +53,23 @@ module duprat_cpu
        0.239314335249683_rp, &
        0.118463442528095_rp ]
 
+  integer, parameter :: N_PANEL = 10
+
 contains
 
-  ! ===========================================================================
-  ! Public: CPG / ZPG entry point (uniform scalar dpdx_const)
-  ! ===========================================================================
-  ! rho_w removed from argument list entirely.
-  ! warm guess from previous tau (tstep argument added).
   subroutine duprat_compute_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
-       n_x, n_y, n_z, nu, h, tau_x, tau_y, tau_z, &
+       n_x, n_y, n_z, nu, rho_w, h, tau_x, tau_y, tau_z, &
        n_nodes, lx, nelv, kappa, beta, A, dpdx_const, tstep)
     integer,       intent(in) :: n_nodes, lx, nelv, tstep
     real(kind=rp), dimension(lx,lx,lx,nelv), intent(in) :: u, v, w
     integer,       intent(in),  dimension(n_nodes) :: ind_r, ind_s, ind_t, ind_e
     real(kind=rp), dimension(n_nodes), intent(in)    :: n_x, n_y, n_z
-    real(kind=rp), dimension(n_nodes), intent(in)    :: nu, h
+    real(kind=rp), dimension(n_nodes), intent(in)    :: nu, rho_w, h
     real(kind=rp), dimension(n_nodes), intent(inout) :: tau_x, tau_y, tau_z
     real(kind=rp), intent(in) :: kappa, beta, A, dpdx_const
 
     integer       :: i
-    real(kind=rp) :: ui, vi, wi, normu, magu, utau, guess
+    real(kind=rp) :: ui, vi, wi, normu, magu, utau, guess, tau_mag
 
     do i = 1, n_nodes
        ui    = u(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
@@ -121,49 +88,38 @@ contains
           cycle
        end if
 
-       ! warm guess from previous tau magnitude; Stokes only at step 1.
        if (tstep .eq. 1) then
           guess = sqrt(magu * nu(i) / h(i))
        else
-          guess = sqrt(sqrt(tau_x(i)**2 + tau_y(i)**2 + tau_z(i)**2))
-          guess = max(guess, 1.0e-10_rp)
+          tau_mag = sqrt(tau_x(i)**2 + tau_y(i)**2 + tau_z(i)**2)
+          guess   = sqrt(tau_mag / max(rho_w(i), 1.0e-14_rp))
+          guess   = max(guess, 1.0e-10_rp)
        end if
 
-       ! no rho_w argument
-       utau = solve_duprat(magu, h(i), guess, nu(i), dpdx_const, &
+       utau = solve_duprat(magu, h(i), guess, nu(i), rho_w(i), dpdx_const, &
                            kappa, beta, A)
 
-       tau_x(i) = -utau**2 * ui / magu
-       tau_y(i) = -utau**2 * vi / magu
-       tau_z(i) = -utau**2 * wi / magu
+       tau_x(i) = -rho_w(i) * utau**2 * ui / magu
+       tau_y(i) = -rho_w(i) * utau**2 * vi / magu
+       tau_z(i) = -rho_w(i) * utau**2 * wi / magu
     end do
 
   end subroutine duprat_compute_cpu
 
-  ! ===========================================================================
-  ! Public: APG entry point (per-node IIR-filtered dpdx array)
-  ! ===========================================================================
-  ! rho_w removed.
-  ! Stokes clamp removed (applied once in duprat.f90 filter update).
-  ! warm guess from previous tau. 
-  !
-  ! @param dpdx_filt  Per-node wall-tangential |dP/ds| [Pa/m], n_nodes.
-  !   Already clamped by the Stokes bound in duprat.f90.
-  !   Zero for t < t_filter_start (ZPG mode).
   subroutine duprat_compute_apg_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
-       n_x, n_y, n_z, nu, h, tau_x, tau_y, tau_z, &
+       n_x, n_y, n_z, nu, rho_w, h, tau_x, tau_y, tau_z, &
        n_nodes, lx, nelv, kappa, beta, A, dpdx_filt, tstep)
     integer,       intent(in) :: n_nodes, lx, nelv, tstep
     real(kind=rp), dimension(lx,lx,lx,nelv), intent(in) :: u, v, w
     integer,       intent(in),  dimension(n_nodes) :: ind_r, ind_s, ind_t, ind_e
     real(kind=rp), dimension(n_nodes), intent(in)    :: n_x, n_y, n_z
-    real(kind=rp), dimension(n_nodes), intent(in)    :: nu, h
+    real(kind=rp), dimension(n_nodes), intent(in)    :: nu, rho_w, h
     real(kind=rp), dimension(n_nodes), intent(inout) :: tau_x, tau_y, tau_z
     real(kind=rp), dimension(n_nodes), intent(in)    :: dpdx_filt
     real(kind=rp), intent(in) :: kappa, beta, A
 
     integer       :: i
-    real(kind=rp) :: ui, vi, wi, normu, magu, utau, guess
+    real(kind=rp) :: ui, vi, wi, normu, magu, utau, guess, tau_mag
 
     do i = 1, n_nodes
        ui    = u(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
@@ -182,86 +138,75 @@ contains
           cycle
        end if
 
-       ! warm guess from previous tau; Stokes only at step 1.
        if (tstep .eq. 1) then
           guess = sqrt(magu * nu(i) / h(i))
        else
-          guess = sqrt(sqrt(tau_x(i)**2 + tau_y(i)**2 + tau_z(i)**2))
-          guess = max(guess, 1.0e-10_rp)
+          tau_mag = sqrt(tau_x(i)**2 + tau_y(i)**2 + tau_z(i)**2)
+          guess   = sqrt(tau_mag / max(rho_w(i), 1.0e-14_rp))
+          guess   = max(guess, 1.0e-10_rp)
        end if
 
-       ! dpdx_filt(i) is already clamped in duprat.f90 -- use directly.
-       ! no rho_w argument.
-       utau = solve_duprat(magu, h(i), guess, nu(i), dpdx_filt(i), &
+       utau = solve_duprat(magu, h(i), guess, nu(i), rho_w(i), dpdx_filt(i), &
                            kappa, beta, A)
 
-       tau_x(i) = -utau**2 * ui / magu
-       tau_y(i) = -utau**2 * vi / magu
-       tau_z(i) = -utau**2 * wi / magu
+       tau_x(i) = -rho_w(i) * utau**2 * ui / magu
+       tau_y(i) = -rho_w(i) * utau**2 * vi / magu
+       tau_z(i) = -rho_w(i) * utau**2 * wi / magu
     end do
 
   end subroutine duprat_compute_apg_cpu
 
-  ! ===========================================================================
-  ! Private: eddy viscosity nu_t*(y*)
-  ! ===========================================================================
-
   pure function nu_t_star(y_star, kappa, beta, A, alpha) result(nut)
     real(kind=rp), intent(in) :: y_star, kappa, beta, A, alpha
-    real(kind=rp) :: nut, l_m, exp_damp
+    real(kind=rp) :: nut, bracket, exp_damp
 
     if (y_star < 1.0e-12_rp) then
        nut = 0.0_rp
        return
     end if
 
-    l_m      = (kappa + beta*(1.0_rp - alpha)**1.5_rp) * y_star
+    bracket  = alpha + y_star * (1.0_rp - alpha)**1.5_rp
     exp_damp = exp(-y_star / (1.0_rp + A*alpha**3))
-    nut      = l_m * (1.0_rp - exp_damp)**2
+    nut      = kappa * y_star * bracket**beta * (1.0_rp - exp_damp)**2
   end function nu_t_star
-
-  ! ===========================================================================
-  ! Private: ODE integration
-  ! 5-point Gauss-Legendre replaces 100-point midpoint (20x speedup).
-  ! GL-5 integrates polynomials of degree <=9 exactly; sufficient here.
-  ! ===========================================================================
 
   pure function integrate_ode(y_star_max, kappa, beta, A, alpha, &
        sign_dpdx) result(U_star)
     real(kind=rp), intent(in) :: y_star_max, kappa, beta, A, alpha, sign_dpdx
-    real(kind=rp) :: U_star, y, factor15
-    integer :: j
+    real(kind=rp) :: U_star, factor15, s_max, ds, s0, s, y, weight
+    integer :: panel, j
 
     U_star = 0.0_rp
     if (y_star_max < 1.0e-12_rp) return
 
     factor15 = (1.0_rp - alpha)**1.5_rp
+    s_max    = log(1.0_rp + y_star_max)
+    ds       = s_max / real(N_PANEL, rp)
 
-    do j = 1, N_GL
-       y      = GL_XI(j) * y_star_max
-       U_star = U_star + GL_W(j) * y_star_max * &
-            (sign_dpdx * factor15 * y + 1.0_rp) / &
-            (1.0_rp + nu_t_star(y, kappa, beta, A, alpha))
+    do panel = 1, N_PANEL
+       s0 = real(panel - 1, rp) * ds
+       do j = 1, N_GL
+          s      = s0 + GL_XI(j) * ds
+          y      = exp(s) - 1.0_rp
+          weight = GL_W(j) * ds * exp(s)
+          U_star = U_star + weight * &
+               (alpha + sign_dpdx * factor15 * y) / &
+               (1.0_rp + nu_t_star(y, kappa, beta, A, alpha))
+       end do
     end do
 
   end function integrate_ode
 
-  ! ===========================================================================
-  ! Private: Newton residual
-  ! rho_w removed -- u_P uses kinematic formula (nu*|dpdx|/2)^(1/3)
-  ! ===========================================================================
-
-  function residual(utau, U_tang, y, nu, dpdx, kappa, beta, A) result(f)
-    real(kind=rp), intent(in) :: utau, U_tang, y, nu, dpdx
+  function residual(utau, U_tang, y, nu, rho_w, dpdx, kappa, beta, A) &
+       result(f)
+    real(kind=rp), intent(in) :: utau, U_tang, y, nu, rho_w, dpdx
     real(kind=rp), intent(in) :: kappa, beta, A
     real(kind=rp) :: f, u_P, u_p_star, alpha, y_star, U_star, sign_dpdx
 
-    ! kinematic pressure velocity scale -- no rho_w division.
-    ! Neko p is kinematic; Duprat eq. 6: u_P = (nu*|dP/dx|/2)^(1/3).
     if (abs(dpdx) < 1.0e-14_rp) then
        u_P = 0.0_rp
     else
-       u_P = (nu * abs(dpdx) / 2.0_rp)**(1.0_rp/3.0_rp)
+       u_P = (nu * abs(dpdx) / max(rho_w, 1.0e-14_rp))**(1.0_rp/3.0_rp)
     end if
 
     u_p_star = sqrt(utau**2 + u_P**2)
@@ -281,15 +226,9 @@ contains
 
   end function residual
 
-  ! ===========================================================================
-  ! Private: Newton-Raphson solver
-  ! rho_w removed from signature.
-  ! tolerance relaxed from 1e-8 to 1e-3 (matches Spalding).
-  ! ===========================================================================
-
-  function solve_duprat(U_tang, y, guess, nu, dpdx, kappa, beta, A) &
+  function solve_duprat(U_tang, y, guess, nu, rho_w, dpdx, kappa, beta, A) &
        result(utau)
-    real(kind=rp), intent(in) :: U_tang, y, guess, nu, dpdx
+    real(kind=rp), intent(in) :: U_tang, y, guess, nu, rho_w, dpdx
     real(kind=rp), intent(in) :: kappa, beta, A
     real(kind=rp) :: utau, f0, f1, df, delta, utau_old, error
     integer :: k
@@ -302,9 +241,10 @@ contains
     do k = 1, 100
        utau_old = utau
 
-       f0    = residual(utau,         U_tang, y, nu, dpdx, kappa, beta, A)
+       f0    = residual(utau, U_tang, y, nu, rho_w, dpdx, kappa, beta, A)
        delta = max(1.0e-6_rp * utau, 1.0e-10_rp)
-       f1    = residual(utau + delta, U_tang, y, nu, dpdx, kappa, beta, A)
+       f1    = residual(utau + delta, U_tang, y, nu, rho_w, dpdx, kappa, &
+                        beta, A)
        df    = (f1 - f0) / delta
 
        if (abs(df) < 1.0e-14_rp) then
@@ -317,10 +257,7 @@ contains
 
        error = abs((utau - utau_old) / (abs(utau) + 1.0e-16_rp))
 
-       ! relaxed tolerance 1e-3 (was 1e-8).
-       ! LES velocities carry O(1%) fluctuation noise; tighter tolerance
-       ! gives no physical benefit and triples iteration count.
-       if (error < 1.0e-3_rp) then
+       if (error < 1.0e-8_rp) then
           converged = .true.
           exit
        end if

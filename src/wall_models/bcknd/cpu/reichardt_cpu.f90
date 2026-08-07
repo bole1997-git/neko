@@ -31,17 +31,6 @@
 ! POSSIBILITY OF SUCH DAMAGE.
 !
 !> Implements the CPU kernel for the `reichardt_t` type.
-!!
-!! Uses the original Reichardt (1951) two-term formula:
-!!
-!!   u+ = (1/kappa)*ln(1 + kappa*y+)
-!!      + 7.8*[1 - exp(-y+/11) - (y+/11)*exp(-y+/3)]
-!!
-!! Reference:
-!!   Reichardt, H. (1951). "Vollstandige Darstellung der turbulenten
-!!   Geschwindigkeitsverteilung in Rohren." Zeitschrift fur angewandte
-!!   Mathematik und Mechanik, 31(7-8), 208-219.
-!!
 module reichardt_cpu
   use num_types, only : rp
   use logger, only : neko_log, NEKO_LOG_DEBUG, LOG_SIZE
@@ -50,46 +39,30 @@ module reichardt_cpu
 
   public :: reichardt_compute_cpu
 
-  ! Reichardt (1951) constants
-  real(kind=rp), parameter :: A_DAMP    = 11.0_rp   ! Damping length scale
-  real(kind=rp), parameter :: B_EXP     = 3.0_rp    ! Exponential decay scale
-  real(kind=rp), parameter :: EXP_COEFF = 7.8_rp    ! Exponential amplitude
+  real(kind=rp), parameter :: A_DAMP    = 11.0_rp
+  real(kind=rp), parameter :: B_EXP     = 3.0_rp
+  real(kind=rp), parameter :: EXP_COEFF = 7.8_rp
 
 contains
 
-  !> Compute the wall shear stress on CPU using the original Reichardt (1951) law.
-  !!
-  !! @param u,v,w      Velocity components on the full (lx,lx,lx,nelv) mesh.
-  !! @param ind_r/s/t/e Off-wall sampling-point indices into the 4D array.
-  !! @param n_x/y/z    Wall-normal unit vector at each boundary node.
-  !! @param nu         Kinematic viscosity at boundary nodes.
-  !! @param h          Wall-normal distance to the sampling point.
-  !! @param tau_x/y/z  Wall shear stress components (inout).
-  !! @param n_nodes    Number of boundary nodes.
-  !! @param lx         GLL polynomial order.
-  !! @param nelv       Number of elements.
-  !! @param kappa      Von Karman constant.
-  !! @param B          Log-law intercept (not used; kept for API compatibility).
-  !! @param tstep      Current time step.
   subroutine reichardt_compute_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
-       n_x, n_y, n_z, nu, h, tau_x, tau_y, tau_z, n_nodes, lx, nelv, &
+       n_x, n_y, n_z, nu, rho_w, h, tau_x, tau_y, tau_z, n_nodes, lx, nelv, &
        kappa, B, tstep)
     integer, intent(in) :: n_nodes, lx, nelv, tstep
     real(kind=rp), dimension(lx, lx, lx, nelv), intent(in) :: u, v, w
     integer, intent(in), dimension(n_nodes) :: ind_r, ind_s, ind_t, ind_e
     real(kind=rp), dimension(n_nodes), intent(in) :: n_x, n_y, n_z, h, nu
+    real(kind=rp), dimension(n_nodes), intent(in) :: rho_w
     real(kind=rp), dimension(n_nodes), intent(inout) :: tau_x, tau_y, tau_z
     real(kind=rp), intent(in) :: kappa, B
     integer :: i
-    real(kind=rp) :: ui, vi, wi, magu, utau, normu, guess
+    real(kind=rp) :: ui, vi, wi, magu, utau, normu, guess, tau_mag
 
     do i = 1, n_nodes
-       ! Sample velocity at the off-wall point.
        ui = u(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
        vi = v(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
        wi = w(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
 
-       ! Remove wall-normal component to get tangential velocity.
        normu = ui * n_x(i) + vi * n_y(i) + wi * n_z(i)
        ui = ui - normu * n_x(i)
        vi = vi - normu * n_y(i)
@@ -97,24 +70,20 @@ contains
 
        magu = sqrt(ui**2 + vi**2 + wi**2)
 
-       ! Initial guess for the Newton solver.
        if (tstep .eq. 1) then
-          ! First timestep: laminar sublayer estimate u_tau ~ sqrt(U*nu/y).
           guess = sqrt(magu * nu(i) / h(i))
        else
-          ! Warm start from previous shear stress magnitude.
-          guess = sqrt(sqrt(tau_x(i)**2 + tau_y(i)**2 + tau_z(i)**2))
+          tau_mag = sqrt(tau_x(i)**2 + tau_y(i)**2 + tau_z(i)**2)
+          guess   = sqrt(tau_mag / max(rho_w(i), 1.0e-14_rp))
+          guess   = max(guess, 1.0e-10_rp)
        end if
 
-       ! Solve for friction velocity u_tau via Newton-Raphson.
        utau = solve_reichardt_cpu(magu, h(i), guess, nu(i), kappa)
 
-       ! Distribute shear stress in the tangential velocity direction:
-       !   tau_wall = -u_tau^2 * (u_tang / |u_tang|)
        if (magu > 1.0e-14_rp) then
-          tau_x(i) = -utau**2 * ui / magu
-          tau_y(i) = -utau**2 * vi / magu
-          tau_z(i) = -utau**2 * wi / magu
+          tau_x(i) = -rho_w(i) * utau**2 * ui / magu
+          tau_y(i) = -rho_w(i) * utau**2 * vi / magu
+          tau_z(i) = -rho_w(i) * utau**2 * wi / magu
        else
           tau_x(i) = 0.0_rp
           tau_y(i) = 0.0_rp
@@ -124,15 +93,6 @@ contains
 
   end subroutine reichardt_compute_cpu
 
-  !> Dimensionless velocity u+ from dimensionless distance y+
-  !! using the original two-term Reichardt (1951) formula.
-  !!
-  !!   u+ = (1/kappa)*ln(1 + kappa*y+)
-  !!      + 7.8*[1 - exp(-y+/11) - (y+/11)*exp(-y+/3)]
-  !!
-  !! Limiting behaviour:
-  !!   y+ -> 0:  u+ -> y+          (viscous sublayer)
-  !!   y+ -> inf: u+ -> (1/kappa)*ln(y+) + B   (log law)
   pure function reichardt_u_plus(y_plus, kappa) result(u_plus)
     real(kind=rp), intent(in) :: y_plus, kappa
     real(kind=rp) :: u_plus
@@ -143,10 +103,8 @@ contains
        return
     end if
 
-    ! Logarithmic term: (1/kappa)*ln(1 + kappa*y+)
     log_term = (1.0_rp / kappa) * log(1.0_rp + kappa * y_plus)
 
-    ! Exponential correction: 7.8*[1 - exp(-y+/11) - (y+/11)*exp(-y+/3)]
     exp_term1 = exp(-y_plus / A_DAMP)
     exp_term2 = (y_plus / A_DAMP) * exp(-y_plus / B_EXP)
 
@@ -154,9 +112,6 @@ contains
 
   end function reichardt_u_plus
 
-  !> Analytical derivative du+/dy+ of the Reichardt (1951) formula.
-  !! Used in the Newton-Raphson iteration via the chain rule:
-  !!   dF/du_tau = u+(y+) + u_tau * (du+/dy+) * (y/nu)
   pure function reichardt_du_plus_dy(y_plus, kappa) result(du_dy)
     real(kind=rp), intent(in) :: y_plus, kappa
     real(kind=rp) :: du_dy
@@ -167,12 +122,8 @@ contains
        return
     end if
 
-    ! Derivative of log term: 1/(1 + kappa*y+)
     d_log = 1.0_rp / (1.0_rp + kappa * y_plus)
 
-    ! Derivative of exponential correction:
-    !   d/dy[7.8*(1 - exp(-y/11) - (y/11)*exp(-y/3))]
-    ! = 7.8*[ (1/11)*exp(-y/11)  -  (1/11)*exp(-y/3)  +  (y/33)*exp(-y/3) ]
     exp_term1 = exp(-y_plus / A_DAMP) / A_DAMP
     exp_term2 = (1.0_rp / A_DAMP) * exp(-y_plus / B_EXP) - &
                 (y_plus / A_DAMP) * (1.0_rp / B_EXP) * exp(-y_plus / B_EXP)
@@ -182,19 +133,6 @@ contains
 
   end function reichardt_du_plus_dy
 
-  !> Newton-Raphson solver for friction velocity u_tau using the Reichardt law.
-  !!
-  !! Solves: F(u_tau) = u_tau * u+(y+) - U = 0
-  !! Jacobian: dF/du_tau = u+ + u_tau * (du+/dy+) * (y/nu)
-  !!
-  !! Non-convergence is logged at DEBUG level, matching the Spalding standard.
-  !!
-  !! @param u     Tangential velocity magnitude U.
-  !! @param y     Wall-normal distance to the sampling point.
-  !! @param guess Initial guess for u_tau.
-  !! @param nu    Kinematic viscosity.
-  !! @param kappa Von Karman constant.
-  !! @return      Friction velocity u_tau.
   function solve_reichardt_cpu(u, y, guess, nu, kappa) result(utau)
     real(kind=rp), intent(in) :: u, y, guess, nu, kappa
     real(kind=rp) :: utau
