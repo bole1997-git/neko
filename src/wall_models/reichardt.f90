@@ -50,24 +50,38 @@ module reichardt
   implicit none
   private
 
+  !> Wall model based on the original Reichardt (1951) law of the wall.
+  !! Reference: https://doi.org/10.1002/zamm.19510310704
   type, public, extends(wall_model_t) :: reichardt_t
+     !> The von Karman coefficient.
      real(kind=rp) :: kappa = 0.41_rp
+     !> The log-law intercept (not used in the Reichardt formula).
      real(kind=rp) :: B = 5.2_rp
+     !> The kinematic viscosity.
      type(vector_t) :: nu
+     !> The fluid density at the boundary.
      type(vector_t) :: rho_w
    contains
+     !> Constructor from JSON.
      procedure, pass(this) :: init => reichardt_init
+     !> Partial constructor from JSON.
      procedure, pass(this) :: partial_init => reichardt_partial_init
+     !> Finalize the construction using the mask and facet arrays of the bc.
      procedure, pass(this) :: finalize => reichardt_finalize
+     !> Constructor from components.
      procedure, pass(this) :: init_from_components => &
           reichardt_init_from_components
+     !> Destructor.
      procedure, pass(this) :: free => reichardt_free
+     !> Compute the kinematic viscosity and density at the wall.
      procedure, pass(this) :: compute_nu => reichardt_compute_nu
+     !> Compute the wall shear stress.
      procedure, pass(this) :: compute => reichardt_compute
   end type reichardt_t
 
 contains
 
+  !> Constructor from JSON.
   subroutine reichardt_init(this, scheme_name, coef, msk, facet, h_index, json)
     class(reichardt_t), intent(inout) :: this
     character(len=*), intent(in) :: scheme_name
@@ -85,6 +99,7 @@ contains
          kappa, B)
   end subroutine reichardt_init
 
+  !> Partial constructor from JSON.
   subroutine reichardt_partial_init(this, coef, json)
     class(reichardt_t), intent(inout) :: this
     type(coef_t), intent(in) :: coef
@@ -96,6 +111,7 @@ contains
 
   end subroutine reichardt_partial_init
 
+  !> Finalize the construction using the mask and facet arrays of the bc.
   subroutine reichardt_finalize(this, msk, facet)
     class(reichardt_t), intent(inout) :: this
     integer, intent(in) :: msk(:)
@@ -106,6 +122,7 @@ contains
     call this%rho_w%init(this%n_nodes)
   end subroutine reichardt_finalize
 
+  !> Constructor from components.
   subroutine reichardt_init_from_components(this, scheme_name, coef, msk, &
        facet, h_index, kappa, B)
     class(reichardt_t), intent(inout) :: this
@@ -127,6 +144,7 @@ contains
     call this%rho_w%init(this%n_nodes)
   end subroutine reichardt_init_from_components
 
+  !> Compute the kinematic viscosity and density at the wall.
   subroutine reichardt_compute_nu(this)
     class(reichardt_t), intent(inout) :: this
     type(field_t), pointer :: temp
@@ -150,6 +168,7 @@ contains
     call neko_scratch_registry%relinquish_field(idx)
   end subroutine reichardt_compute_nu
 
+  !> Destructor.
   subroutine reichardt_free(this)
     class(reichardt_t), intent(inout) :: this
     call this%free_base()
@@ -157,7 +176,9 @@ contains
     call this%rho_w%free()
   end subroutine reichardt_free
 
-  !> GPU backend not yet implemented.
+  !> Compute the wall shear stress. GPU backend not yet implemented.
+  !! @param t The time value.
+  !! @param tstep The current time-step.
   subroutine reichardt_compute(this, t, tstep)
     class(reichardt_t), intent(inout) :: this
     real(kind=rp), intent(in) :: t

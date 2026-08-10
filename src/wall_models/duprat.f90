@@ -52,16 +52,28 @@ module duprat
   implicit none
   private
 
+  !> Wall model based on Duprat et al. (2011) extended law of the wall.
+  !! Reference: https://doi.org/10.1063/1.3529358
   type, public, extends(wall_model_t) :: duprat_t
+     !> The von Karman coefficient.
      real(kind=rp) :: kappa = 0.41_rp
+     !> Pressure-gradient mixing-length exponent.
      real(kind=rp) :: beta  = 0.78_rp
+     !> Van Driest damping constant.
      real(kind=rp) :: A     = 17.0_rp
+     !> Use a constant streamwise dP/dx instead of the filtered field value.
      logical        :: use_constant_dpdx = .true.
+     !> Constant streamwise pressure gradient, used if use_constant_dpdx.
      real(kind=rp) :: dpdx_const = 0.0_rp
+     !> Simulation time at which the pressure-gradient filter starts.
      real(kind=rp) :: t_filter_start = 5.0_rp
+     !> Time constant of the pressure-gradient filter.
      real(kind=rp) :: t_filter       = 1.0_rp
+     !> The kinematic viscosity.
      type(vector_t) :: nu
+     !> The fluid density at the boundary.
      type(vector_t) :: rho_w
+     !> Per-node filtered wall-tangential pressure gradient.
      real(kind=rp), allocatable :: dpdx_filt(:)
      real(kind=rp), allocatable :: grad_px(:,:,:,:)
      real(kind=rp), allocatable :: grad_py(:,:,:,:)
@@ -72,17 +84,25 @@ module duprat
      integer        :: grad_tstep = 0
      real(kind=rp) :: t_prev = -1.0_rp
    contains
+     !> Constructor from JSON.
      procedure, pass(this) :: init              => duprat_init
+     !> Partial constructor from JSON.
      procedure, pass(this) :: partial_init      => duprat_partial_init
+     !> Finalize the construction using the mask and facet arrays of the bc.
      procedure, pass(this) :: finalize          => duprat_finalize
+     !> Constructor from components.
      procedure, pass(this) :: init_from_components => duprat_init_from_components
+     !> Destructor.
      procedure, pass(this) :: free              => duprat_free
+     !> Compute the kinematic viscosity and density at the wall.
      procedure, pass(this) :: compute_nu        => duprat_compute_nu
+     !> Compute the wall shear stress.
      procedure, pass(this) :: compute           => duprat_compute
   end type duprat_t
 
 contains
 
+  !> Constructor from JSON.
   subroutine duprat_init(this, scheme_name, coef, msk, facet, h_index, json)
     class(duprat_t), intent(inout) :: this
     character(len=*), intent(in)   :: scheme_name
@@ -106,6 +126,7 @@ contains
          t_filter)
   end subroutine duprat_init
 
+  !> Partial constructor from JSON.
   subroutine duprat_partial_init(this, coef, json)
     class(duprat_t), intent(inout) :: this
     type(coef_t),    intent(in)    :: coef
@@ -125,6 +146,7 @@ contains
          1.0_rp)
   end subroutine duprat_partial_init
 
+  !> Finalize the construction using the mask and facet arrays of the bc.
   subroutine duprat_finalize(this, msk, facet)
     class(duprat_t), intent(inout) :: this
     integer,         intent(in)    :: msk(:), facet(:)
@@ -156,6 +178,7 @@ contains
     end if
   end subroutine duprat_finalize
 
+  !> Constructor from components.
   subroutine duprat_init_from_components(this, scheme_name, coef, msk, &
        facet, h_index, kappa, beta, A, use_constant_dpdx, dpdx_const, &
        t_filter_start, t_filter)
@@ -204,6 +227,7 @@ contains
     end if
   end subroutine duprat_init_from_components
 
+  !> Destructor.
   subroutine duprat_free(this)
     class(duprat_t), intent(inout) :: this
     call this%free_base()
@@ -218,6 +242,7 @@ contains
     if (allocated(this%grad_pz_buf )) deallocate(this%grad_pz_buf )
   end subroutine duprat_free
 
+  !> Compute the kinematic viscosity and density at the wall.
   subroutine duprat_compute_nu(this)
     class(duprat_t), intent(inout) :: this
     type(field_t), pointer :: temp
@@ -241,7 +266,9 @@ contains
     call neko_scratch_registry%relinquish_field(idx)
   end subroutine duprat_compute_nu
 
-  !> GPU backend not yet implemented.
+  !> Compute the wall shear stress. GPU backend not yet implemented.
+  !! @param t The time value.
+  !! @param tstep The current time-step.
   subroutine duprat_compute(this, t, tstep)
     class(duprat_t), intent(inout) :: this
     real(kind=rp),   intent(in)    :: t
@@ -278,6 +305,7 @@ contains
 
     else
 
+       ! Update the filtered pressure gradient once per time-step.
        if (tstep .ne. this%grad_tstep) then
 
           if (this%t_prev < 0.0_rp) then
@@ -322,6 +350,7 @@ contains
                      this%ind_r(i), this%ind_s(i), &
                      this%ind_t(i), this%ind_e(i))
 
+                ! Remove the wall-normal component
                 dp_n  = dpx*this%n_x%x(i) + dpy*this%n_y%x(i) + &
                         dpz*this%n_z%x(i)
                 dp_tx = dpx - dp_n*this%n_x%x(i)
@@ -330,10 +359,12 @@ contains
 
                 dpdx_local = sqrt(dp_tx**2 + dp_ty**2 + dp_tz**2)
 
+                ! Sign from the velocity-aligned component
                 dpdx_local = dpdx_local * &
                      sign(1.0_rp, dp_tx*(ui/magu) + dp_ty*(vi/magu) + &
                                   dp_tz*(wi/magu))
 
+                ! Stokes clamp on the pressure gradient
                 max_dpdx = this%rho_w%x(i) * &
                      (magu * this%nu%x(i) / this%h%x(i))**1.5_rp &
                      / this%nu%x(i)

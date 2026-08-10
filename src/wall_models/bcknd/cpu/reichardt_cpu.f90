@@ -39,12 +39,18 @@ module reichardt_cpu
 
   public :: reichardt_compute_cpu
 
+  !> Damping length scale in the Reichardt (1951) formula.
   real(kind=rp), parameter :: A_DAMP    = 11.0_rp
+  !> Exponential decay scale in the Reichardt (1951) formula.
   real(kind=rp), parameter :: B_EXP     = 3.0_rp
+  !> Exponential-term amplitude in the Reichardt (1951) formula.
   real(kind=rp), parameter :: EXP_COEFF = 7.8_rp
 
 contains
 
+  !> Compute the wall shear stress on cpu using Reichardt's model.
+  !! @param rho_w The fluid density at the boundary.
+  !! @param tstep The current time-step.
   subroutine reichardt_compute_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
        n_x, n_y, n_z, nu, rho_w, h, tau_x, tau_y, tau_z, n_nodes, lx, nelv, &
        kappa, B, tstep)
@@ -59,10 +65,12 @@ contains
     real(kind=rp) :: ui, vi, wi, magu, utau, normu, guess, tau_mag
 
     do i = 1, n_nodes
+       ! Sample the velocity
        ui = u(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
        vi = v(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
        wi = w(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
 
+       ! Project on tangential direction
        normu = ui * n_x(i) + vi * n_y(i) + wi * n_z(i)
        ui = ui - normu * n_x(i)
        vi = vi - normu * n_y(i)
@@ -70,6 +78,7 @@ contains
 
        magu = sqrt(ui**2 + vi**2 + wi**2)
 
+       ! Get initial guess for Newton solver
        if (tstep .eq. 1) then
           guess = sqrt(magu * nu(i) / h(i))
        else
@@ -80,6 +89,7 @@ contains
 
        utau = solve_reichardt_cpu(magu, h(i), guess, nu(i), kappa)
 
+       ! Distribute according to the velocity vector
        if (magu > 1.0e-14_rp) then
           tau_x(i) = -rho_w(i) * utau**2 * ui / magu
           tau_y(i) = -rho_w(i) * utau**2 * vi / magu
@@ -93,6 +103,7 @@ contains
 
   end subroutine reichardt_compute_cpu
 
+  !> Dimensionless velocity u+ from dimensionless distance y+.
   pure function reichardt_u_plus(y_plus, kappa) result(u_plus)
     real(kind=rp), intent(in) :: y_plus, kappa
     real(kind=rp) :: u_plus
@@ -112,6 +123,7 @@ contains
 
   end function reichardt_u_plus
 
+  !> Derivative du+/dy+, used in the Newton Jacobian.
   pure function reichardt_du_plus_dy(y_plus, kappa) result(du_dy)
     real(kind=rp), intent(in) :: y_plus, kappa
     real(kind=rp) :: du_dy
@@ -133,6 +145,7 @@ contains
 
   end function reichardt_du_plus_dy
 
+  !> Newton solver for the friction velocity using Reichardt's model.
   function solve_reichardt_cpu(u, y, guess, nu, kappa) result(utau)
     real(kind=rp), intent(in) :: u, y, guess, nu, kappa
     real(kind=rp) :: utau

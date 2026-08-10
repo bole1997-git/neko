@@ -30,7 +30,7 @@
 ! ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
 ! POSSIBILITY OF SUCH DAMAGE.
 !
-!> CPU kernels for `duprat_t`.
+!> Implements the CPU kernel for the `duprat_t` type.
 module duprat_cpu
   use num_types, only: rp
   use logger, only: neko_log, NEKO_LOG_DEBUG, LOG_SIZE
@@ -39,6 +39,7 @@ module duprat_cpu
 
   public :: duprat_compute_cpu, duprat_compute_apg_cpu
 
+  !> 5-point Gauss-Legendre nodes/weights on [0,1], used per panel.
   integer,  parameter :: N_GL = 5
   real(rp), parameter :: GL_XI(N_GL) = [ &
        0.046910077936172_rp, &
@@ -53,10 +54,15 @@ module duprat_cpu
        0.239314335249683_rp, &
        0.118463442528095_rp ]
 
+  !> Number of panels in the composite quadrature.
   integer, parameter :: N_PANEL = 10
 
 contains
 
+  !> Compute the wall shear stress on cpu using Duprat's model, constant dP/dx.
+  !! @param rho_w The fluid density at the boundary.
+  !! @param dpdx_const Constant streamwise pressure gradient.
+  !! @param tstep The current time-step.
   subroutine duprat_compute_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
        n_x, n_y, n_z, nu, rho_w, h, tau_x, tau_y, tau_z, &
        n_nodes, lx, nelv, kappa, beta, A, dpdx_const, tstep)
@@ -72,9 +78,12 @@ contains
     real(kind=rp) :: ui, vi, wi, normu, magu, utau, guess, tau_mag
 
     do i = 1, n_nodes
+       ! Sample the velocity
        ui    = u(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
        vi    = v(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
        wi    = w(ind_r(i), ind_s(i), ind_t(i), ind_e(i))
+
+       ! Project on tangential direction
        normu = ui*n_x(i) + vi*n_y(i) + wi*n_z(i)
        ui    = ui - normu*n_x(i)
        vi    = vi - normu*n_y(i)
@@ -88,6 +97,7 @@ contains
           cycle
        end if
 
+       ! Get initial guess for Newton solver
        if (tstep .eq. 1) then
           guess = sqrt(magu * nu(i) / h(i))
        else
@@ -99,6 +109,7 @@ contains
        utau = solve_duprat(magu, h(i), guess, nu(i), rho_w(i), dpdx_const, &
                            kappa, beta, A)
 
+       ! Distribute according to the velocity vector
        tau_x(i) = -rho_w(i) * utau**2 * ui / magu
        tau_y(i) = -rho_w(i) * utau**2 * vi / magu
        tau_z(i) = -rho_w(i) * utau**2 * wi / magu
@@ -106,6 +117,10 @@ contains
 
   end subroutine duprat_compute_cpu
 
+  !> Compute the wall shear stress on cpu using Duprat's model, filtered dP/dx.
+  !! @param rho_w The fluid density at the boundary.
+  !! @param dpdx_filt Per-node filtered wall-tangential pressure gradient.
+  !! @param tstep The current time-step.
   subroutine duprat_compute_apg_cpu(u, v, w, ind_r, ind_s, ind_t, ind_e, &
        n_x, n_y, n_z, nu, rho_w, h, tau_x, tau_y, tau_z, &
        n_nodes, lx, nelv, kappa, beta, A, dpdx_filt, tstep)
@@ -156,6 +171,7 @@ contains
 
   end subroutine duprat_compute_apg_cpu
 
+  !> Eddy viscosity nu_t*(y*) of the Duprat profile at one quadrature point.
   pure function nu_t_star(y_star, kappa, beta, A, alpha) result(nut)
     real(kind=rp), intent(in) :: y_star, kappa, beta, A, alpha
     real(kind=rp) :: nut, bracket, exp_damp
@@ -170,6 +186,8 @@ contains
     nut      = kappa * y_star * bracket**beta * (1.0_rp - exp_damp)**2
   end function nu_t_star
 
+  !> Integrate the Duprat velocity-profile ODE over [0, y_star_max].
+  !! Log-transformed composite Gauss-Legendre quadrature.
   pure function integrate_ode(y_star_max, kappa, beta, A, alpha, &
        sign_dpdx) result(U_star)
     real(kind=rp), intent(in) :: y_star_max, kappa, beta, A, alpha, sign_dpdx
@@ -197,6 +215,9 @@ contains
 
   end function integrate_ode
 
+  !> Newton residual for the friction velocity.
+  !! @param rho_w The fluid density at the boundary.
+  !! @param dpdx Streamwise pressure gradient.
   function residual(utau, U_tang, y, nu, rho_w, dpdx, kappa, beta, A) &
        result(f)
     real(kind=rp), intent(in) :: utau, U_tang, y, nu, rho_w, dpdx
@@ -226,6 +247,9 @@ contains
 
   end function residual
 
+  !> Newton solver for the friction velocity using Duprat's model.
+  !! @param rho_w The fluid density at the boundary.
+  !! @param dpdx Streamwise pressure gradient.
   function solve_duprat(U_tang, y, guess, nu, rho_w, dpdx, kappa, beta, A) &
        result(utau)
     real(kind=rp), intent(in) :: U_tang, y, guess, nu, rho_w, dpdx
